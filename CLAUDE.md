@@ -14,6 +14,18 @@ AI 网关。透传优先、Provider 描述文件驱动、Hold/Capture 预付费�
 
 文档同时记录了**被否决方案及其理由**（如为何不用 Pingora、为何不用 StarRocks 作唯一后端、为何冻结记录必须落库）。改动任何已定决策前，先读对应章节。
 
+## 开发环境
+
+```bash
+./scripts/dev-db.sh                 # 起开发库（Docker，端口 5433）
+export DATABASE_URL=postgres://postgres:gwdev@localhost:5433/gateway
+cargo test --workspace              # 集成测试需要 DATABASE_URL
+cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
+cargo sqlx prepare --workspace -- --all-targets   # 改过 SQL 后重新生成 .sqlx
+```
+
+改动 SQL 或迁移后必须重新生成 `.sqlx/` 并提交，否则 CI 编译不过。
+
 ## 工程规约
 
 - 全 workspace `unsafe_code = "forbid"`

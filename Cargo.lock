@@ -724,6 +724,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gw-identity"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "gw-core",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
 name = "gw-infra"
 version = "0.1.0"
 dependencies = [
@@ -799,6 +810,25 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "gw-registry"
+version = "0.1.0"
+dependencies = [
+ "gw-core",
+ "serde",
+ "smol_str",
+ "thiserror",
+]
+
+[[package]]
+name = "gw-router"
+version = "0.1.0"
+dependencies = [
+ "gw-core",
+ "thiserror",
+ "url",
 ]
 
 [[package]]
@@ -2923,6 +2953,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

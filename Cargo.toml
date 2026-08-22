@@ -36,6 +36,7 @@ sha2 = "0.10"
 figment = { version = "0.10", features = ["toml", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
+url = { version = "2", features = ["serde"] }
 tiktoken-rs = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 rstest = "0.25"
@@ -50,6 +51,9 @@ gw-gateway = { path = "crates/gateway" }
 gw-proxy = { path = "crates/proxy" }
 gw-infra = { path = "crates/infra" }
 gw-bin = { path = "crates/bin" }
+gw-registry = { path = "crates/registry" }
+gw-router = { path = "crates/router" }
+gw-identity = { path = "crates/identity" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

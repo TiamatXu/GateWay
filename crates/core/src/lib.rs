@@ -2,6 +2,7 @@
 
 pub mod extract;
 pub mod ids;
+pub mod inbound;
 pub mod money;
 pub mod redact;
 pub mod shape;
@@ -9,6 +10,7 @@ pub mod usage;
 
 pub use extract::UsageExtractor;
 pub use ids::{AccountId, ApiKeyId, ChannelId, HandleId, HoldId, NodeId, ProviderId, RequestId};
+pub use inbound::InboundRequest;
 pub use money::Money;
 pub use redact::HeaderRedactor;
 pub use shape::{
