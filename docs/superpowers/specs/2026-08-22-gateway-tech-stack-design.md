@@ -62,7 +62,7 @@
 5. **用量提取与协议转换解耦**。由 Provider 描述文件声明 JSONPath / SSE 聚合规则从原生响应抽 usage，上游不返回时用 tokenizer 兜底。否则透传模式无法计费。
 6. **预付费 = Hold / Capture 双分录账本**。准入时按最坏情况原子冻结，完成时按实际捕获，Hold 带 TTL + 后台回收器。所有账本操作带幂等键，账本 append-only，余额是物化视图。
 7. **转换必须无损 + 能力协商**。IR 携带原始 body 副本与 extensions 透传映射；目标协议无法表达源协议特性时，按策略选择 strict 报错或 lenient 降级并回写警告 header，绝不静默丢字段。适配器按「规范协议」注册，避免 N×N 爆炸。
-8. **数据平面完全无状态**。亲和性是「虚拟ID → 上游渠道」的，不是「客户端 → 网关节点」的，因此不需要 sticky session 或一致性哈希。节点故障不影响已创建的异步任务。
+8. **数据平面对请求-响应型端点完全无状态**。亲和性是「虚拟ID → 上游渠道」的，不是「客户端 → 网关节点」的，因此不需要 sticky session 或一致性哈希。节点故障不影响已创建的异步任务。**唯一例外是 `Duplex`（WebSocket）端点**：连接本身绑定在具体节点上，节点故障会断开会话、需客户端重连。该例外不破坏句柄亲和模型，因为 Duplex 会话不签发可轮询的句柄；详见 §9.7。
 9. **请求日志与账本物理分离**。账本要事务与精确，日志要压缩与聚合，混在同一实例是 New API 已知的规模瓶颈。
 
 ---
@@ -108,6 +108,7 @@ Rust 在本项目的三个具体红利：
 | 上游客户端（转换） | `reqwest` | 转换路径本就要完整读取 body，高层 API 更省事 |
 | 反向代理 | **自研**（见 §4.3） | Rust 无 `httputil.ReverseProxy` 等价物 |
 | SSE 解析 | `eventsource-stream` | 只做 `byte stream → Event`，不夹带 HTTP 客户端，正是 tee 旁路需要的形态 |
+| WebSocket | `axum::extract::ws`（入站）+ `tokio-tungstenite`（上游） | `Duplex` 端点所需，见 §9.7 |
 | JSONPath | `serde_json_path` | RFC 9535 合规，跟随官方 CTS 测试套件；用于描述文件的 usage 提取 |
 | 数据库驱动 | `sqlx`（PostgreSQL） | `query!` 宏在编译期连库校验 SQL 与类型，对账本 SQL 是强正确性保障 |
 | 数据库迁移 | `sqlx::migrate!` | 内建，SQL 文件 embed 进二进制，零额外依赖 |
@@ -149,6 +150,8 @@ Rust 在本项目的三个具体红利：
 9. **轻量 job scheduler**。基于 advisory lock 保证单实例执行的巡检任务框架。
 10. **`proto` 规范协议类型定义**。见 §4.4。
 11. **优雅退出与连接排空**。SIGTERM 后停止接受新请求、等待在途流自然结束、归还本节点持有的全部租约。
+12. **双向流的双侧计量**。`Duplex` 端点两个方向都需抽取用量（上行音频秒数、下行 token 与音频秒数），且需在会话存续期间滚动结算，而非终态一次性结算。
+13. **会话级滚动 Hold**。`BillingTiming::Session` 要求 Hold 随会话推进分段追加与捕获，与请求级 Hold 是不同的生命周期模型。
 
 ### 4.4 已评估并否决的方案
 
@@ -335,6 +338,89 @@ gateway/
 以下尚未确定，需在后续 spec 中解决：
 
 1. **里程碑拆分方案**。已提出「纵向骨架优先」与「地基优先」两种切法及 M0–M6 序列，尚未拍板。
-2. **首批支持的厂商与端点清单**。将作为 Provider 描述层表达力的验收标准。已点名的必须项：火山引擎资产 API、阿里云百炼原生异步端点。
+2. **端点覆盖空白区调研**。厂商与端点清单不需自行枚举——社区网关已有现成清单，本项目按热门度排优先级逐步接入。真正需要产出的是「主流网关普遍不支持的端点」清单，那份空白清单是产品差异化的靶子。不阻塞 `core` 建模，在 M2（Provider 描述层）动工前完成即可。
 3. **多租户模型层级**。组织 / 项目 / 用户三层，还是两层。影响成本归属报表与 SSO 映射。
 4. **hook 机制的引入时机与形态**。WASM（`wasmtime`）与内置 Rust hook 的取舍，以及是否在早期里程碑就需要。
+
+---
+
+## 9. 端点形态建模（EndpointShape）
+
+### 9.1 问题
+
+产品目标是「所有厂商的所有端点，并在社区网关不支持的端点之上支持更多」。因此端点清单是**开放集合**，任何形式的枚举都会迅速过期；而枚举若定义在 `core` crate 中，每次过期都触发全量重编译。
+
+### 9.2 拆分：端点身份与端点形态
+
+| 概念 | 性质 | 归属 |
+|---|---|---|
+| **端点身份**（`/v1/chat/completions`、`/api/v3/contents/generations/tasks`） | 开放集合 | 完全由 Provider 描述文件声明，`core` 中不出现 |
+| **端点形态** | 有限集合 | `core` 中建模。网关的处理逻辑本就只有数种 |
+
+需要建模的只有后者，且它是若干**正交维度的组合**，不是一维枚举。
+
+### 9.3 五个维度
+
+```rust
+pub struct EndpointShape {
+    pub request:  RequestForm,    // 请求体如何进入
+    pub response: ResponseForm,   // 响应体如何返回
+    pub handle:   HandleRole,     // 与虚拟句柄的关系
+    pub billing:  BillingTiming,  // 结算时点
+    pub retry:    RetryPolicy,    // 故障转移时是否可重试
+}
+
+pub enum RequestForm   { None, Json, Multipart, Binary, JsonThenBinary }
+pub enum ResponseForm  { Json, Sse, Ndjson, Binary, Duplex }
+pub enum HandleRole    { None, Issues(HandleKind), Consumes(HandleKind), Terminates(HandleKind) }
+pub enum BillingTiming { InRequest, OnTerminal, Metered, Session, NotBilled }
+pub enum RetryPolicy   { Safe, IdempotentWithKey, Unsafe }
+```
+
+任何新端点都是这五个维度的一个组合。**新增端点不需要修改 `core`，只需增加一份 YAML 声明。**
+
+### 9.4 模型压测
+
+用六个最刁钻的真实端点验证覆盖度：
+
+| 端点 | request | response | handle | billing | retry |
+|---|---|---|---|---|---|
+| 阿里云百炼 文生视频提交 | `Json` | `Json` | `Issues(Task)` | `OnTerminal` | `IdempotentWithKey` |
+| 阿里云百炼 任务查询 | `None` | `Json` | `Consumes(Task)` | `NotBilled` | `Safe` |
+| 火山引擎 资产上传（签名直传） | `JsonThenBinary` | `Json` | `Issues(Asset)` | `Metered` | `Unsafe` |
+| Gemini `cachedContents` 创建 | `Json` | `Json` | `Issues(Cache)` | `Metered` | `IdempotentWithKey` |
+| Anthropic Batches 结果下载 | `None` | `Ndjson` | `Consumes(Batch)` | `NotBilled` | `Safe` |
+| OpenAI Realtime | `None`（WS upgrade） | `Duplex` | `None` | `Session` | `Unsafe` |
+
+六者全部落入模型，无需新增变体。其中三种形态是社区网关普遍不支持的，构成本项目的差异化落点：
+
+- `JsonThenBinary`——签名直传式上传
+- `Metered`——按存续时长计费的缓存与资产
+- `Session`——会话内滚动计费
+
+### 9.5 衍生推导
+
+两项关键策略可直接从形态推导，无需在描述文件中重复声明，减少两处出错点：
+
+| 推导项 | 依据 | 规则 |
+|---|---|---|
+| 渠道亲和性 | `HandleRole` | `Consumes` / `Terminates` 必须回到签发该句柄的原渠道；`Issues` / `None` 无亲和要求 |
+| 预扣策略 | `BillingTiming` | `InRequest` 按最坏情况估算预扣；`OnTerminal` 按任务上限预扣且 Hold 挂在句柄对象上；`Metered` 按周期滚动；`Session` 随会话分段追加 |
+
+### 9.6 验收标准
+
+产品差异化在于端点覆盖广度，因此验收指标不是「接入了多少厂商」，而是：
+
+> **接入一个全新端点需要编写 0 行 Rust 代码。**
+
+逃生舱为 hook 机制，用于五维模型确实装不下的情形（自定义签名算法、需预先换取 token 的鉴权流程等）。目标比例为 **95% 端点纯 YAML、5% 走 hook**。若实际比例显著低于此，应判定为描述文件表达力设计不足，需回头修正模型——而非逐个添加特例。
+
+### 9.7 `Duplex` 的额外影响
+
+`Duplex`（WebSocket 双向流，如 OpenAI Realtime、豆包实时语音）已确认纳入第一版实现。它对架构有三处超出「多一个枚举变体」的影响：
+
+**一、Duplex 端点仅支持透传，不支持跨协议转换。** 各厂商实时协议的事件模型差异极大（OpenAI Realtime、Gemini Live、豆包实时语音的会话状态机互不兼容），跨协议转换的成本与收益严重不成比例。第一版明确不做；若未来要做，应作为独立的适配器族设计。
+
+**二、会话与节点存在粘性。** 这是 §2 第 8 条「数据平面无状态」的唯一例外。WebSocket 连接绑定在具体节点上，节点故障即断开会话，需客户端重连。该例外不破坏句柄亲和模型——Duplex 会话不签发可轮询的句柄——但要求：负载均衡器必须支持 WebSocket；优雅退出的等待窗口需覆盖实时会话时长。
+
+**三、计量与结算模型不同。** 两个方向都需抽取用量（上行音频秒数、下行 token 与音频秒数），且必须在会话存续期间滚动结算。请求级的「预扣—结算」两段式模型在此不适用，需要 `Session` 专属的分段 Hold 生命周期。此项已列入自研清单第 12、13 条，并将在 M1（账本做实）中一并设计。
