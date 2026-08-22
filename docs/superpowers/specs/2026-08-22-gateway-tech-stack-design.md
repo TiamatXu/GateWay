@@ -103,7 +103,7 @@ Rust 在本项目的三个具体红利：
 | 数据库驱动 | `sqlx`（PostgreSQL） | `query!` 宏在编译期连库校验 SQL 与类型，对账本 SQL 是强正确性保障 |
 | 数据库迁移 | `sqlx::migrate!` | 内建，SQL 文件 embed 进二进制，零额外依赖 |
 | Redis（可选） | `fred` | 异步、连接池、重连；便于用熔断器包裹以实现降级 |
-| ClickHouse 客户端 | `clickhouse`（官方 crate） | 请求日志与用量分析的写入端 |
+| 日志 sink | `clickhouse`（默认）／`sqlx` MySQL feature（StarRocks·Doris）／`sqlx` PG（兜底） | 抽象为 `LogSink` trait，见 §5.3 |
 | 序列化 | `serde` + `serde_json`；热点路径可换 `sonic-rs` | 透传路径不解析 JSON，只有转换路径承压 |
 | YAML | `serde_norway`（或 `saphyr`） | ⚠️ `serde_yaml` 已停止维护 |
 | Schema 校验 | `jsonschema` | Provider 描述文件必须有 schema 校验，否则用户写错 YAML 只能在运行时暴露 |
@@ -146,7 +146,7 @@ Rust 生态在以下位置没有可直接使用的组件，均需自行实现。
 | 账本、余额、Hold、租约 | **PostgreSQL** | 唯一真相源，要事务与精确 |
 | 资源句柄映射、任务状态 | PostgreSQL | 低 QPS |
 | 配置、价格规则、Provider 描述 | PostgreSQL + 各节点内存快照 | 极低频写，高频读 |
-| 请求日志、用量分析 | ClickHouse | 与账本物理分离 |
+| 请求日志、用量分析 | ClickHouse（默认，**可插拔**） | 与账本物理分离；sink 可替换，见 §5.3 |
 | 冻结/限流加速、配置 pub/sub | Redis（**可选**） | 纯加速器，故障时降级到 PG 路径而非 fail-closed |
 
 **不支持 SQLite。** 单机模式同样使用 PostgreSQL。
@@ -166,6 +166,24 @@ Rust 生态在以下位置没有可直接使用的组件，均需自行实现。
 采用整数而非 `rust_decimal` 的三个理由：`balance - held >= amt` 在 `BIGINT` 上是整数比较，在 `NUMERIC` 上是变长十进制运算；decimal 在请求热路径上产生大量堆分配；整数无精度歧义，「余额守恒」不变量可被严格断言。
 
 newtype 包装为零成本，同时禁止裸 `i64` 混入金额运算。
+
+### 5.3 日志 Sink 可插拔
+
+请求日志与用量分析的写入端抽象为 `LogSink` trait，提供三个实现：
+
+| 实现 | 定位 | 客户端 |
+|---|---|---|
+| `clickhouse` | **默认**，开源自部署推荐 | `clickhouse` crate |
+| `mysql-wire` | 覆盖 StarRocks / Doris / SelectDB，企业已有集群时使用 | `sqlx` MySQL feature |
+| `postgres` | 兜底，小规模或不愿新增组件时复用同一个 PG | `sqlx` PostgreSQL |
+
+**默认选 ClickHouse 的理由是部署重量。** 它是单进程、数百 MB 内存即可运行；StarRocks 需要 FE（JVM）与 BE 两类进程，生产高可用需 3 FE + 3 BE。本项目以开源自部署为主要分发形态，`docker-compose` 的组件数量是核心门槛。其次是日志场景的压缩比——model / channel / user_id 等低基数列重复度极高，列存压缩可达 10–20 倍。
+
+**保留 mysql-wire 实现的理由。** 一份实现同时覆盖 StarRocks / Doris / SelectDB 三家，且复用已有的 sqlx 依赖，增量成本低。企业用户通常已有此类集群，可避免为网关单独运维 ClickHouse；BI 工具与既有报表系统亦可直连。
+
+**已评估并否决：将 StarRocks 设为唯一后端。** 其主键模型支持实时 UPSERT，看似契合「异步任务日志需回填终态」的场景。但任务的权威状态本就应存于 PostgreSQL——Hold 的生命周期挂在任务对象上，必须与账本同库同事务——日志侧只需在终态写入一条计费记录，更新需求不成立。StarRocks 的 JOIN 能力优于 ClickHouse 的 Dictionary 维表方案，但不足以抵消部署重量的差距。
+
+**实现注意**：sqlx 的 `query!` 编译期校验依赖 `information_schema`，StarRocks 与 MySQL 存在差异，该路径需退回运行时 `query()` API。日志写入的 SQL 结构简单，可以接受。
 
 ---
 
@@ -260,4 +278,3 @@ gateway/
 2. **首批支持的厂商与端点清单**。将作为 Provider 描述层表达力的验收标准。已点名的必须项：火山引擎资产 API、阿里云百炼原生异步端点。
 3. **多租户模型层级**。组织 / 项目 / 用户三层，还是两层。影响成本归属报表与 SSO 映射。
 4. **hook 机制的引入时机与形态**。WASM（`wasmtime`）与内置 Rust hook 的取舍，以及是否在早期里程碑就需要。
-5. **日志 sink 的抽象边界**。ClickHouse 是必选依赖还是可插拔（另有 PG / 文件 JSONL 实现）。
