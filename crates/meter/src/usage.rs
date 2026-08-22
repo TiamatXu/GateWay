@@ -19,10 +19,35 @@ struct UsageRule {
     accum: Accum,
 }
 
+/// tokenizer 编码。词表 embed 进二进制，不做运行时下载。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tokenizer {
+    O200kBase,
+    Cl100kBase,
+}
+
+impl Tokenizer {
+    fn count(self, text: &str) -> usize {
+        let bpe = match self {
+            Self::O200kBase => tiktoken_rs::o200k_base_singleton(),
+            Self::Cl100kBase => tiktoken_rs::cl100k_base_singleton(),
+        };
+        bpe.encode_ordinary(text).len()
+    }
+}
+
+#[derive(Debug)]
+struct TextFallback {
+    dim: UsageDim,
+    path: JsonPath,
+    tokenizer: Tokenizer,
+}
+
 /// 用量抽取规则集。最终形态由 Provider 描述文件提供，M0 在代码中构造。
 #[derive(Debug, Default)]
 pub struct UsageSpec {
     rules: Vec<UsageRule>,
+    fallback: Option<TextFallback>,
 }
 
 impl UsageSpec {
@@ -45,6 +70,37 @@ impl UsageSpec {
             accum,
         });
         Ok(self)
+    }
+
+    /// 第 3 档兜底：上游未返回权威 usage 时，按生成文本估算该维度。
+    ///
+    /// # Errors
+    /// `path` 不是合法的 RFC 9535 `JSONPath` 时返回错误。
+    pub fn text_fallback(
+        mut self,
+        dim: impl Into<UsageDim>,
+        path: &str,
+        tokenizer: Tokenizer,
+    ) -> Result<Self, ParseError> {
+        self.fallback = Some(TextFallback {
+            dim: dim.into(),
+            path: JsonPath::parse(path)?,
+            tokenizer,
+        });
+        Ok(self)
+    }
+
+    /// 逐帧累加：全量缓存生成文本会突破每流内存预算。分帧编码在边界处
+    /// 略有偏差，但结果本就标记为估算值。
+    fn accumulate_fallback(&self, doc: &serde_json::Value, tokens: &mut i64) {
+        let Some(fb) = &self.fallback else { return };
+        for node in fb.path.query(doc).all() {
+            if let Some(text) = node.as_str()
+                && !text.is_empty()
+            {
+                *tokens += i64::try_from(fb.tokenizer.count(text)).unwrap_or(i64::MAX);
+            }
+        }
     }
 
     fn apply(&self, doc: &serde_json::Value, out: &mut UsageVector) {
@@ -83,6 +139,8 @@ pub struct SseUsageExtractor {
     parser: SseParser,
     spec: UsageSpec,
     usage: UsageVector,
+    /// 兜底估算出的 token 数，仅在权威 usage 缺席时生效
+    fallback_tokens: i64,
 }
 
 impl SseUsageExtractor {
@@ -92,27 +150,53 @@ impl SseUsageExtractor {
             parser: SseParser::new(),
             spec,
             usage: UsageVector::new(),
+            fallback_tokens: 0,
         }
+    }
+
+    /// 权威 usage 是否已到达。
+    fn has_authoritative(&self) -> bool {
+        self.spec
+            .fallback
+            .as_ref()
+            .is_none_or(|fb| self.usage.get(fb.dim.as_str()) != 0)
+    }
+
+    fn resolved(&self) -> UsageVector {
+        if self.has_authoritative() || self.fallback_tokens == 0 {
+            return self.usage.clone();
+        }
+        let mut u = self.usage.clone();
+        if let Some(fb) = &self.spec.fallback {
+            u.set(fb.dim.clone(), self.fallback_tokens);
+        }
+        u
     }
 }
 
 impl UsageExtractor for SseUsageExtractor {
     fn feed(&mut self, chunk: &[u8]) {
         let (spec, usage) = (&self.spec, &mut self.usage);
+        let fallback = &mut self.fallback_tokens;
         self.parser.feed(chunk, |ev| {
             // 上游可能发回 [DONE] 哨兵或错误文本，解析失败即跳过
             if let Ok(doc) = serde_json::from_str::<serde_json::Value>(ev.data) {
                 spec.apply(&doc, usage);
+                spec.accumulate_fallback(&doc, fallback);
             }
         });
     }
 
     fn snapshot(&self) -> UsageVector {
-        self.usage.clone()
+        self.resolved()
     }
 
     fn finish(self: Box<Self>) -> UsageVector {
-        self.usage
+        self.resolved()
+    }
+
+    fn estimated(&self) -> bool {
+        !self.has_authoritative() && self.fallback_tokens != 0
     }
 }
 
@@ -225,6 +309,57 @@ mod tests {
         let mut e = SseUsageExtractor::new(openai_spec());
         e.feed(format!("data: {{\"usage\":{{\"prompt_tokens\":{raw}}}}}\n\n").as_bytes());
         assert!(e.snapshot().is_empty(), "{raw} 未被忽略");
+    }
+
+    // ------------------------------------------------- 第 3 档：tokenizer 兜底
+
+    fn spec_with_fallback() -> UsageSpec {
+        openai_spec()
+            .text_fallback(
+                dims::OUTPUT_TOKENS,
+                "$.choices[*].delta.content",
+                Tokenizer::O200kBase,
+            )
+            .unwrap()
+    }
+
+    /// 客户端中途断连，携带 usage 的末帧从未到达：按已生成文本估算
+    #[test]
+    fn estimates_output_tokens_when_usage_never_arrives() {
+        let mut e = SseUsageExtractor::new(spec_with_fallback());
+        e.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\" hello\"}}]}\n\n");
+        e.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n");
+
+        assert_eq!(e.snapshot().get(dims::OUTPUT_TOKENS), 2);
+        assert!(e.estimated(), "估算值未被标记");
+    }
+
+    /// 权威 usage 一旦到达即覆盖估算值，且不再标记为估算
+    #[test]
+    fn authoritative_usage_overrides_the_estimate() {
+        let mut e = SseUsageExtractor::new(spec_with_fallback());
+        e.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\" hello\"}}]}\n\n");
+        e.feed(b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":42}}\n\n");
+
+        assert_eq!(e.snapshot().get(dims::OUTPUT_TOKENS), 42);
+        assert!(!e.estimated());
+    }
+
+    /// 未配置兜底时保持原样：不估算、不标记
+    #[test]
+    fn without_fallback_a_truncated_stream_yields_nothing() {
+        let mut e = SseUsageExtractor::new(openai_spec());
+        e.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\" hello\"}}]}\n\n");
+
+        assert!(e.snapshot().is_empty());
+        assert!(!e.estimated());
+    }
+
+    /// 空流不产生估算
+    #[test]
+    fn empty_stream_estimates_nothing() {
+        let e = SseUsageExtractor::new(spec_with_fallback());
+        assert!(e.snapshot().is_empty());
     }
 
     #[test]

@@ -70,6 +70,12 @@ impl Tee {
         self.usage.snapshot()
     }
 
+    /// 用量是否为估算值。必须一路传到账单，否则计费争议无法举证。
+    #[must_use]
+    pub fn estimated(&self) -> bool {
+        self.usage.estimated()
+    }
+
     #[must_use]
     pub fn archive_failed(&self) -> bool {
         self.archive_failed

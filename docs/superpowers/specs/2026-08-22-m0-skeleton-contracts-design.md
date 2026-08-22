@@ -164,6 +164,9 @@ pub trait UsageExtractor: Send {
     fn feed(&mut self, chunk: &[u8]);
     fn snapshot(&self) -> UsageVector;
     fn finish(self: Box<Self>) -> UsageVector;
+
+    /// 用量是否为 tokenizer 估算值
+    fn estimated(&self) -> bool { false }
 }
 ```
 
@@ -179,6 +182,10 @@ pub struct Tee {
 **归档失败绝不影响 usage 抽取，也绝不影响请求本身。** 账单必须无条件抽出，归档是可开关的旁路。M0 只实现 usage，但 tee 结构按最终形态建。
 
 `snapshot()` 是断连结算的关键——它返回当前已抽取到的用量，不要求流已结束。
+
+`estimated()` 是 §4.6 三档兜底的必要出口。**客户端中途断连时，携带 usage 的末帧
+从未到达**——第 1 档拿不到数据，若不落到第 3 档用 tokenizer 估算，断连就等于免费，
+这是可被利用的漏洞。估算结果必须标记并一路传到账单记录，否则计费争议无法举证。
 
 `feed` 必须是纯状态机推进，不做 IO、不做阻塞操作，否则会拖慢转发。
 

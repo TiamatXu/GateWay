@@ -32,6 +32,8 @@ pub struct RequestRecord {
     pub usage: UsageVector,
     pub amount: Option<Money>,
     pub status: RequestStatus,
+    /// 用量为 tokenizer 估算值。explain 接口须明示。
+    pub estimated: bool,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
 }
@@ -84,9 +86,13 @@ impl Settler {
 
     async fn settle(&self, hold: Hold, tee: SharedTee, ctx: SettlementCtx) {
         // 锁中毒说明有线程 panic 过，但已抽取的用量仍然有效，不能因此漏账
-        let usage = tee
-            .lock()
-            .map_or_else(|e| e.into_inner().snapshot(), |t| t.snapshot());
+        let (usage, estimated) = match tee.lock() {
+            Ok(t) => (t.snapshot(), t.estimated()),
+            Err(e) => {
+                let t = e.into_inner();
+                (t.snapshot(), t.estimated())
+            }
+        };
 
         let price_ctx = PriceCtx {
             model: &ctx.model,
@@ -128,6 +134,7 @@ impl Settler {
             usage,
             amount,
             status,
+            estimated,
             started_at: ctx.started_at,
             ended_at: Utc::now(),
         });
@@ -264,17 +271,23 @@ mod tests {
         }
     }
 
-    struct FixedUsage(i64);
+    struct FixedUsage {
+        tokens: i64,
+        estimated: bool,
+    }
 
     impl UsageExtractor for FixedUsage {
         fn feed(&mut self, _chunk: &[u8]) {}
         fn snapshot(&self) -> UsageVector {
             let mut u = UsageVector::new();
-            u.set("output_tokens", self.0);
+            u.set("output_tokens", self.tokens);
             u
         }
         fn finish(self: Box<Self>) -> UsageVector {
             self.snapshot()
+        }
+        fn estimated(&self) -> bool {
+            self.estimated
         }
     }
 
@@ -318,7 +331,14 @@ mod tests {
     }
 
     fn guard(h: &Harness, tokens: i64) -> SettlementGuard {
-        let tee = Arc::new(Mutex::new(Tee::new(Box::new(FixedUsage(tokens)))));
+        guard_with(h, tokens, false)
+    }
+
+    fn guard_with(h: &Harness, tokens: i64, estimated: bool) -> SettlementGuard {
+        let tee = Arc::new(Mutex::new(Tee::new(Box::new(FixedUsage {
+            tokens,
+            estimated,
+        }))));
         SettlementGuard::new(
             Hold::stub(Money::from_nanos(1_000), h.reclaim_tx.clone()),
             tee,
@@ -400,6 +420,20 @@ mod tests {
 
         let rec = h.logs.try_recv().unwrap();
         assert_eq!(rec.status, RequestStatus::Ok);
+        assert_eq!(rec.amount, Some(Money::from_nanos(60)));
+    }
+
+    /// 估算值必须一路传到账单记录
+    #[tokio::test]
+    async fn records_that_usage_was_estimated() {
+        let mut h = harness(false, 16);
+
+        drop(guard_with(&h, 30, true));
+        h.settler.tasks().close();
+        h.settler.tasks().wait().await;
+
+        let rec = h.logs.try_recv().unwrap();
+        assert!(rec.estimated);
         assert_eq!(rec.amount, Some(Money::from_nanos(60)));
     }
 

@@ -9,6 +9,11 @@ publish.workspace = true
 [dependencies]
 gw-core = { workspace = true }
 bytes = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyper-rustls = { workspace = true }
+http-body-util = { workspace = true }
 futures-core = { workspace = true }
 pin-project-lite = { workspace = true }
 thiserror = { workspace = true }

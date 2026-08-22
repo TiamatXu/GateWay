@@ -4,4 +4,4 @@ pub mod sse;
 pub mod usage;
 
 pub use sse::{SseEvent, SseParser};
-pub use usage::{Accum, SseUsageExtractor, UsageSpec};
+pub use usage::{Accum, SseUsageExtractor, Tokenizer, UsageSpec};
