@@ -376,15 +376,18 @@ CREATE TABLE account_balance (
     PRIMARY KEY (account_id, shard)
 );
 
+-- status：0 = 活跃，1 = 已捕获，2 = 已撤销，3 = 已过期回收
 CREATE TABLE hold (
     id              UUID PRIMARY KEY,
     amount          BIGINT NOT NULL,
     timing          SMALLINT NOT NULL,
+    status          SMALLINT NOT NULL DEFAULT 0,
     idempotency_key TEXT NOT NULL UNIQUE,
     expires_at      TIMESTAMPTZ NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    settled_at      TIMESTAMPTZ
 );
-CREATE INDEX hold_expires_idx ON hold (expires_at);
+CREATE INDEX hold_expires_idx ON hold (expires_at) WHERE status = 0;
 
 -- 一个 Hold 在账户链上的每一级各占一行。M0 恒为一行，M1 起可多行。
 CREATE TABLE hold_leg (
@@ -449,6 +452,31 @@ CREATE TABLE price_rule (
 );
 
 CREATE TABLE config_version (id INT PRIMARY KEY DEFAULT 1, version BIGINT NOT NULL);
+```
+
+`hold` 行结算后不删除，只置 `status`。**删除会释放 `idempotency_key`**——已结算请求的重试会被当作全新请求二次冻结、二次扣费。代价是 `hold` 表持续增长，需要归档策略（M9）。
+
+`request_log` 是 `LogSink` 的 postgres 实现所需，M0 仅此一种落地形态：
+
+```sql
+CREATE TABLE request_log (
+    request_id    UUID PRIMARY KEY,
+    key_id        BIGINT,
+    account_chain BIGINT[] NOT NULL,
+    node_path     LTREE,
+    channel_id    BIGINT,
+    model         TEXT NOT NULL,
+    endpoint      TEXT NOT NULL,
+    shape         JSONB NOT NULL,
+    usage         JSONB NOT NULL,
+    quote         JSONB,
+    status        SMALLINT NOT NULL,
+    req_headers   JSONB NOT NULL,      -- 已脱敏
+    resp_headers  JSONB NOT NULL,      -- 已脱敏
+    archive_ref   TEXT,                -- M6 填充
+    started_at    TIMESTAMPTZ NOT NULL,
+    ended_at      TIMESTAMPTZ NOT NULL
+);
 ```
 
 `api_key.account_chain` 是物化列，组织树或 Account 绑定变更时批量重算。
