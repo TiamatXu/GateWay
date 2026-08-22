@@ -123,7 +123,7 @@ Rust 在本项目的三个具体红利：
 | 日志 / 追踪 | `tracing` + `tracing-subscriber` + `tracing-opentelemetry` | 结构化日志与分布式追踪同源 |
 | 指标 | `metrics` + `metrics-exporter-prometheus` | |
 | Tokenizer | `tiktoken-rs`（OpenAI 系）+ `tokenizers`（HF，开放权重模型），词表离线 embed | 严禁运行时下载词表；覆盖边界见 §4.6 |
-| 认证 | `openidconnect` / `ldap3` / `jsonwebtoken` / `argon2` | 企业 SSO 与后台登录 |
+| 认证 | `openidconnect`（标准 OIDC）/ `oauth2`（钉钉·飞书·企微·GitHub 等非标）/ `ldap3` / `jsonwebtoken` / `argon2` | 见身份模型 spec §7 |
 | WASM hook（后期） | `wasmtime` | |
 | 测试 | `rstest` + `proptest` + `testcontainers` + `loom` | proptest 断言「余额守恒」不变量；loom 验证账本并发 |
 | 前端 | React + Vite + Semi Design | 沿用 New API 的前端技术栈；产物用 `rust-embed` 嵌入二进制 |
@@ -207,6 +207,7 @@ Rust 在本项目的三个具体红利：
 | 数据 | 存储 | 说明 |
 |---|---|---|
 | 账本、余额、Hold、租约 | **PostgreSQL** | 唯一真相源，要事务与精确 |
+| 组织树、账户、API Key、身份绑定 | PostgreSQL（**需 `ltree` 扩展**） | 任意深度部门树；祖先/后代查询走 GiST 索引 |
 | 资源句柄映射、任务状态 | PostgreSQL | 低 QPS |
 | 配置、价格规则、Provider 描述 | PostgreSQL + 各节点内存快照 | 极低频写，高频读 |
 | 请求日志、用量分析 | ClickHouse（默认，**可插拔**） | 与账本物理分离；sink 可替换，见 §5.3 |
@@ -271,6 +272,8 @@ gateway/
 │   ├── transform/          # 适配器 + 能力协商 strict/lenient
 │   ├── proxy/              # 自研零拷贝流式反向代理 + tee 旁路
 │   ├── resource/           # 虚拟句柄映射、渠道亲和、异步任务状态机、孤儿巡检
+│   ├── identity/           # 组织树、账户链解析、API Key、目录同步（SCIM +
+│   │                       #   钉钉/飞书/企微连接器）、第三方登录
 │   ├── router/             # 路由决策、负载均衡、熔断（纯本地状态）
 │   ├── gateway/            # 数据平面 axum app：鉴权、准入、dispatcher、生命周期编排
 │   ├── console/            # 控制平面 axum app：管理 API、多租户、SSO
@@ -289,11 +292,11 @@ gateway/
 |---|---|
 | `core` | 全部 crate |
 | `infra` | `store`, `gateway`, `console`, `bin` |
-| `store` | `ledger`, `pricing`, `registry`, `resource` |
+| `store` | `ledger`, `pricing`, `registry`, `resource`, `identity` |
 | `proto` | `transform`, `meter` |
 | `registry` | `router`, `meter`, `pricing` |
-| `ledger`, `pricing`, `meter`, `proxy`, `resource`, `router`, `transform` | `gateway` |
-| `store`, `ledger`, `pricing`, `registry` | `console` |
+| `ledger`, `pricing`, `meter`, `proxy`, `resource`, `router`, `transform`, `identity` | `gateway` |
+| `store`, `ledger`, `pricing`, `registry`, `identity` | `console` |
 | `gateway`, `console` | `bin` |
 
 `gateway` 是数据平面的顶层编排者，`console` 是控制平面的顶层编排者，两者互不依赖；`bin` 只负责组装它们。
@@ -303,6 +306,7 @@ gateway/
 - **`core` 保持极瘦**。被所有 crate 依赖，任何改动触发全量重编译。只放类型，不放逻辑，不引重依赖。
 - **`transform` 单独隔离**。未来改动最频繁（每接一个厂商就动），隔离后其改动不触发 `ledger` / `store` 重编译。
 - **`proto` 与 `transform` 分离**。proto 是稳定类型定义，transform 是易变逻辑；合并会让类型改动的编译代价被逻辑改动频率放大。
+- **`identity` 独立于 `console`**。目录同步（SCIM server + 三个国内平台连接器）与第三方登录（两类共十余个平台）的逻辑量大且演进独立；账户链解析还需被 `gateway` 的热路径调用，不能锁在控制平面里。注意 `ledger` **不**依赖 `identity`——它只接受 `&[AccountId]`，账户链由 `gateway` 解析后传入，保持两者解耦。
 - **`resource` 暂不拆分**。虚拟句柄映射与异步任务托管共享同一生命周期概念，先合并；待边界在实现中确认清晰后再拆为 `handle` + `task`。
 
 ### 6.4 部署形态
@@ -422,5 +426,5 @@ pub enum RetryPolicy   { Safe, IdempotentWithKey, Unsafe }
 
 1. **里程碑拆分方案**。已提出「纵向骨架优先」与「地基优先」两种切法及 M0–M6 序列，尚未拍板。
 2. **端点覆盖空白区调研**。厂商与端点清单不需自行枚举——社区网关已有现成清单，本项目按热门度排优先级逐步接入。真正需要产出的是「主流网关普遍不支持的端点」清单，那份空白清单是产品差异化的靶子。不阻塞 `core` 建模，在 M2（Provider 描述层）动工前完成即可。
-3. **多租户模型层级**。组织 / 项目 / 用户三层，还是两层。影响成本归属报表与 SSO 映射。
+3. ~~多租户模型层级~~ — **已解决**，见 [身份、组织与计费主体模型](2026-08-22-identity-org-billing-model-design.md)。结论：单棵任意深度组织树（ltree），计费主体 `Account` 与层级解耦、可挂任意节点，请求解析为账户链；嵌套额度第一版完整实现。
 4. **hook 机制的引入时机与形态**。WASM（`wasmtime`）与内置 Rust hook 的取舍，以及是否在早期里程碑就需要。
