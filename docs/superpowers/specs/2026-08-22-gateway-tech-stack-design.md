@@ -107,7 +107,7 @@ Rust 在本项目的三个具体红利：
 | 上游客户端（透传） | `hyper` + `hyper-util` legacy client | 必须贴着 hyper，避免高层封装引入 body 缓冲 |
 | 上游客户端（转换） | `reqwest` | 转换路径本就要完整读取 body，高层 API 更省事 |
 | 反向代理 | **自研**（见 §4.3） | Rust 无 `httputil.ReverseProxy` 等价物 |
-| SSE 解析 | `eventsource-stream` | 只做 `byte stream → Event`，不夹带 HTTP 客户端，正是 tee 旁路需要的形态 |
+| SSE 解析 | **自研推模式解析器** | 见 §4.4——`eventsource-stream` 只有拉模式 `Stream` 适配器，与 tee 旁路的同步 `feed(&[u8])` 不兼容 |
 | WebSocket | `axum::extract::ws`（入站）+ `tokio-tungstenite`（上游） | `Duplex` 端点所需，见 §8.7 |
 | JSONPath | `serde_json_path` | RFC 9535 合规，跟随官方 CTS 测试套件；用于描述文件的 usage 提取 |
 | 数据库驱动 | `sqlx`（PostgreSQL） | `query!` 宏在编译期连库校验 SQL 与类型，对账本 SQL 是强正确性保障 |
@@ -142,7 +142,7 @@ Rust 在本项目的三个具体红利：
 
 1. **流式反向代理**。`Body → Stream → hyper client → Stream → Body`，全程零拷贝、零缓冲。
 2. **动态 dispatcher**。路由需按「协议规范 + 端点形态」匹配，并支持整段通配透传（如 `/v1/*`）。框架 router 只负责最外层挂载。
-3. **SSE tee 旁路**。`eventsource-stream` 提供帧解析，但「边转发边增量抽取 usage、且不阻塞不缓冲下游」的编排需自研；客户端中途断连时需按已生成部分结算。
+3. **SSE 帧解析与 tee 旁路**。推模式增量解析器（任意字节切分、三种行尾、跨块多字节字符）与「边转发边增量抽取 usage、且不阻塞不缓冲下游」的编排均需自研；客户端中途断连时需按已生成部分结算。
 4. **Coordinator 的 PG 实现**。原子冻结语句、热点账户分片、配额租约与回收、双模式（严格/租约）切换。
 5. **Provider 描述文件的 schema 与解释器**。
 6. **用量提取引擎**。JSONPath 取值、SSE 增量聚合、tokenizer 兜底三者的编排——零件齐备，编排自研。
@@ -166,6 +166,10 @@ Rust 在本项目的三个具体红利：
 - 官方定位明确：其适用场景是「CPU 效率成为账单项」的规模。本项目不在该量级。其缓存相关 API 目前仍标注为 experimental 且高度不稳定。
 
 **代价**：放弃零停机优雅重载。对 SSE 流可达 10 分钟的网关这有实际价值，但 K8s 滚动更新可覆盖多数场景；裸机部署的开源用户无法受益。接受此取舍。
+
+**`eventsource-stream` 作为 SSE 解析库。** 它只做 `byte stream → Event`，不夹带 HTTP 客户端，形态本身合适。否决理由是**推拉模式不匹配**：它仅暴露 `EventStream<S>` 这一 `Stream` 适配器（拉模式），而 tee 旁路要求 `UsageExtractor::feed(&[u8])` 与转发**同步**执行——套一层 `Stream` 就必须引入通道与独立任务，等于在转发路径上增加 await 点与跨任务调度，与 M0 spec §6「`feed` 不得引入额外 await 点或锁竞争」直接冲突。其 `parser::line` 虽为 `pub`，但只处理单行，缓冲与 UTF-8 跨块拼接（真正的难点）仍需自写，为此背上 `nom` 依赖不划算。
+
+**代价**：SSE 解析这段状态机由自己保证正确性。缓解措施是测试覆盖——逐字节喂入与整体喂入结果一致、proptest 覆盖任意切分位置、三种行尾及其跨块切分、多字节字符跨块。
 
 **`async-openai` 作为 `proto` crate 的依赖。** 该 crate 支持 `serde(flatten)` 扩展与 `byot`（bring your own types）feature，可容纳未知字段。否决理由：它为「调用 OpenAI」设计，而非「无损转发任意 OpenAI 兼容厂商请求」。本架构要求每个类型携带 `#[serde(flatten)] extra` 与原始 body 副本，这是一等公民要求而非可选扩展；且它仅覆盖 OpenAI，Anthropic / Gemini 的规范协议仍需自写。更关键的是，依赖第三方类型定义等于将协议演进速度交予上游发版节奏。
 
