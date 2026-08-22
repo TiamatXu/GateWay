@@ -1,0 +1,25 @@
+[package]
+name = "gw-pricing"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+gw-core = { workspace = true }
+gw-store = { workspace = true }
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+smallvec = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+gw-store = { workspace = true, features = ["testkit"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

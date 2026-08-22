@@ -194,11 +194,17 @@ pub trait PriceEngine: Send + Sync {
 pub struct Quote {
     pub amount: Money,
     pub cost: Money,                              // 成本价，用于毛利计算
-    pub rule_id: RuleId,
+    pub rule_ids: SmallVec<[RuleId; 8]>,          // 参与本次计价的全部规则
     pub rule_version: i64,                        // 快照绑定
     pub breakdown: Vec<(UsageDim, i64, Money)>,   // explain 数据
     pub estimated: bool,                          // 用量为估算值时置位
 }
+```
+
+`rule_ids` 是复数：一次计价按维度各匹配一条规则，单个 `rule_id` 无法指向实际生效的
+规则集合。痛点之一是「表达式控制价格复杂不直观」，explain 必须能精确指到每条规则。
+
+```rust
 ```
 
 ```rust
@@ -583,7 +589,7 @@ SSE extractor 的跨 chunk 断帧测试必须覆盖——真实网络下 SSE 帧
 |---|---|---|
 | `Coordinator` | 仅 `pg`，`chain` 长度恒为 1 | M1 |
 | 租约与双模式 | 无，逐请求走 PG | M1 |
-| `PriceEngine` | 单价 × 用量向量，无阶梯与时段 | M5 |
+| `PriceEngine` | 单价 × 用量向量，无阶梯与时段；预扣按固定上限估算 | M5 |
 | 组织树 | Root + 单个 Personal 节点 + 单个 Account | M8 |
 | `ProviderRegistry` | 硬编码单厂商，不读 YAML | M2 |
 | 句柄与异步 | 无 | M3 |

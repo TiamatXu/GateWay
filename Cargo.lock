@@ -538,6 +538,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gw-pricing"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "gw-core",
+ "gw-store",
+ "smallvec",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "gw-store"
 version = "0.1.0"
 dependencies = [
