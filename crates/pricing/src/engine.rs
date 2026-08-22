@@ -29,6 +29,8 @@ pub struct PriceCtx<'a> {
     /// 同时决定命中哪个价格版本
     pub at: DateTime<Utc>,
     pub max_output_tokens: Option<u32>,
+    /// 已知的真实输入用量。为 `None` 时按配置上限估算——宁可高估也不能不预扣。
+    pub input_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,12 +149,13 @@ impl PriceEngine for PgPriceEngine {
         let output_ceiling = ctx
             .max_output_tokens
             .map_or(self.ceilings.output_tokens, i64::from);
+        let input_ceiling = ctx.input_tokens.unwrap_or(self.ceilings.input_tokens);
 
         let mut total = Money::from_nanos(0);
         for rule in &rules {
             // 只有可预估上限的维度参与预扣，其余维度在结算时才知道
             let quantity = match rule.dim.as_str() {
-                dims::INPUT_TOKENS => self.ceilings.input_tokens,
+                dims::INPUT_TOKENS => input_ceiling,
                 dims::OUTPUT_TOKENS | dims::REASONING_TOKENS => output_ceiling,
                 _ => continue,
             };

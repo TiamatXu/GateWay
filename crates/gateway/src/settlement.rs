@@ -114,7 +114,9 @@ impl Settler {
             tier: &ctx.tier,
             endpoint: &ctx.endpoint,
             at: ctx.started_at,
+            // 结算用的是实际用量，估算参数无关
             max_output_tokens: None,
+            input_tokens: None,
         };
 
         let (status, amount) = match self.pricing.quote(&price_ctx, &usage).await {

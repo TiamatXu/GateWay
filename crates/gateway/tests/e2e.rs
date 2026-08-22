@@ -77,6 +77,7 @@ const UNIT_PRICE: i64 = 1_000_000;
 
 struct Fixture {
     _serial: tokio::sync::MutexGuard<'static, ()>,
+    initial_balance: i64,
     base: String,
     pool: PgPool,
     load: Arc<LoadGuard>,
@@ -206,6 +207,7 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
 
     Fixture {
         _serial: serial,
+        initial_balance: balance,
         base: format!("http://{addr}"),
         pool,
         load,
@@ -218,6 +220,45 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
 }
 
 impl Fixture {
+    /// 在同一 fixture 内再建一把 API Key（各自独立账户）。
+    /// 不能再调 setup()——它持有串行锁，重复申请会自锁。
+    async fn add_api_key(&self, balance: i64) -> String {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let node_id: i64 = sqlx::query_scalar(
+            "INSERT INTO org_node (uuid, path, kind, source, name)
+             VALUES ($1, text2ltree($2), 0, 0, 'e2e') RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(format!("n{suffix}"))
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let account: i64 =
+            sqlx::query_scalar("INSERT INTO account (node_id) VALUES ($1) RETURNING id")
+                .bind(node_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+        sqlx::query("INSERT INTO account_balance (account_id, shard, balance) VALUES ($1, 0, $2)")
+            .bind(account)
+            .bind(balance)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        let key = format!("sk-gw-{suffix}");
+        sqlx::query(
+            "INSERT INTO api_key (node_id, hash, prefix, account_chain) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(node_id)
+        .bind(&gw_gateway::key_hash(&key)[..])
+        .bind(gw_gateway::key_prefix(&key))
+        .bind(vec![account])
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        key
+    }
+
     fn request(&self, path: &str, stream: bool) -> reqwest::RequestBuilder {
         reqwest::Client::new()
             .post(format!("{}{path}", self.base))
@@ -242,9 +283,10 @@ impl Fixture {
 
     /// 结算在独立任务中完成，轮询等待其落库
     async fn settled(&self) -> (i64, i64) {
+        let initial = self.initial_balance;
         for _ in 0..100 {
             let b = self.balances().await;
-            if b.1 == 0 && b.0 != START_BALANCE {
+            if b.1 == 0 && b.0 != initial {
                 return b;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -330,6 +372,91 @@ async fn writes_a_billing_record_with_redacted_headers() {
         !row.2.to_string().contains(&fx.api_key),
         "API Key 明文出现在了请求日志中"
     );
+}
+
+/// 预扣按真实输入量估算：小额余额也要能发出小请求
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn holds_only_what_the_request_actually_needs() {
+    use futures::StreamExt;
+
+    // 余额远小于「输入按 1000 token 上限」所需的预扣
+    let fx = setup(300, 64).await;
+
+    let resp = fx
+        .request("/v1/chat/completions", true)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "预扣过粗，小请求被误拒");
+
+    // 在途时读一下冻结额：输入是极短的 "hi"，冻结应远小于上限
+    let mut stream = resp.bytes_stream();
+    stream.next().await.unwrap().unwrap();
+    let (_, held) = fx.balances().await;
+    assert!(held > 0, "未冻结");
+    assert!(held < 200, "冻结额仍按上限估算：{held}");
+
+    drop(stream);
+    fx.settled().await;
+}
+
+/// 同一 Idempotency-Key 的重放不得二次扣费
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replaying_an_idempotency_key_does_not_charge_twice() {
+    let fx = setup(START_BALANCE, 64).await;
+
+    let first = fx
+        .request("/v1/chat/completions", true)
+        .header("idempotency-key", "abc-123")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    first.text().await.unwrap();
+    let after_first = fx.settled().await;
+
+    let replay = fx
+        .request("/v1/chat/completions", true)
+        .header("idempotency-key", "abc-123")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(replay.status(), 409);
+    let body: serde_json::Value = replay.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "duplicate_request");
+    assert_eq!(fx.balances().await, after_first, "重放二次扣费了");
+}
+
+/// 不同 Key 用同一个 Idempotency-Key 互不影响
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idempotency_keys_are_scoped_per_api_key() {
+    let fx = setup(START_BALANCE, 64).await;
+
+    let first = fx
+        .request("/v1/chat/completions", true)
+        .header("idempotency-key", "shared-key")
+        .send()
+        .await
+        .unwrap();
+    first.text().await.unwrap();
+    fx.settled().await;
+
+    // 另一把 Key 用同样的 Idempotency-Key
+    let other_key = fx.add_api_key(START_BALANCE).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", fx.base))
+        .bearer_auth(&other_key)
+        .header("idempotency-key", "shared-key")
+        .json(&serde_json::json!({
+            "model": fx.model, "stream": true, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "幂等键跨租户串了");
 }
 
 // ------------------------------------------------------------------ 验收项 2

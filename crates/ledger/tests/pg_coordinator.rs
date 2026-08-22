@@ -233,6 +233,25 @@ async fn concurrent_holds_never_overdraw() {
     assert_held_matches_active_legs(&fx.pool, acct).await;
 }
 
+/// 已结算的幂等键被重放：必须能与「Hold 非活跃」区分开，
+/// 否则调用方只能一律当成内部错误返回 500
+#[tokio::test]
+async fn replaying_a_settled_key_is_reported_as_duplicate() {
+    let f = setup().await;
+    let a = account(&f.pool, 1_000).await;
+    let k = key();
+    let hold = f.coord.hold(req(&[a], 300, &k)).await.unwrap();
+    f.coord.capture(hold, Money::from_nanos(100)).await.unwrap();
+
+    let err = f.coord.hold(req(&[a], 300, &k)).await.unwrap_err();
+
+    assert!(
+        matches!(err, LedgerError::DuplicateRequest { .. }),
+        "{err:?}"
+    );
+    assert_eq!(balances(&f.pool, a).await, (900, 0), "重放不得再次冻结");
+}
+
 // ------------------------------------------------------------- capture / void
 
 #[tokio::test]

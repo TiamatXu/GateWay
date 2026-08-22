@@ -415,7 +415,11 @@ impl PgCoordinator {
             return Err(LedgerError::HoldNotActive);
         };
         if row.status != ACTIVE {
-            return Err(LedgerError::HoldNotActive);
+            // 已结算的键被重放，与「Hold 非活跃」是两种情况：前者应告知调用方
+            // 这是重复请求，后者是内部状态错误
+            return Err(LedgerError::DuplicateRequest {
+                key: idempotency_key.to_owned(),
+            });
         }
 
         let chain = sqlx::query_scalar!(

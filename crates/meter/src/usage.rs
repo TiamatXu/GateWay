@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use gw_core::{UsageDim, UsageExtractor, UsageVector};
 use serde_json_path::{JsonPath, ParseError};
 
@@ -27,7 +29,7 @@ pub enum Tokenizer {
 }
 
 impl Tokenizer {
-    fn count(self, text: &str) -> usize {
+    pub(crate) fn count(self, text: &str) -> usize {
         let bpe = match self {
             Self::O200kBase => tiktoken_rs::o200k_base_singleton(),
             Self::Cl100kBase => tiktoken_rs::cl100k_base_singleton(),
@@ -137,7 +139,7 @@ fn as_i64(v: &serde_json::Value) -> Option<i64> {
 #[derive(Debug)]
 pub struct SseUsageExtractor {
     parser: SseParser,
-    spec: UsageSpec,
+    spec: Arc<UsageSpec>,
     usage: UsageVector,
     /// 兜底估算出的 token 数，仅在权威 usage 缺席时生效
     fallback_tokens: i64,
@@ -145,7 +147,7 @@ pub struct SseUsageExtractor {
 
 impl SseUsageExtractor {
     #[must_use]
-    pub fn new(spec: UsageSpec) -> Self {
+    pub fn new(spec: Arc<UsageSpec>) -> Self {
         Self {
             parser: SseParser::new(),
             spec,
@@ -203,13 +205,13 @@ impl UsageExtractor for SseUsageExtractor {
 /// 从非流式 JSON 响应中抽取用量。整段缓冲后解析——单次响应体量有限。
 #[derive(Debug)]
 pub struct JsonUsageExtractor {
-    spec: UsageSpec,
+    spec: Arc<UsageSpec>,
     buf: Vec<u8>,
 }
 
 impl JsonUsageExtractor {
     #[must_use]
-    pub fn new(spec: UsageSpec) -> Self {
+    pub fn new(spec: Arc<UsageSpec>) -> Self {
         Self {
             spec,
             buf: Vec::new(),
@@ -258,7 +260,7 @@ mod tests {
 
     #[test]
     fn extracts_usage_from_final_chunk() {
-        let mut e = SseUsageExtractor::new(openai_spec());
+        let mut e = SseUsageExtractor::new(Arc::new(openai_spec()));
         e.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
         e.feed(b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n");
         e.feed(b"data: [DONE]\n\n");
@@ -271,7 +273,7 @@ mod tests {
     /// 断连结算的关键：流未结束时也能读到已抽取的用量
     #[test]
     fn snapshot_reflects_partial_stream() {
-        let mut e = SseUsageExtractor::new(openai_spec());
+        let mut e = SseUsageExtractor::new(Arc::new(openai_spec()));
         assert!(e.snapshot().is_empty());
 
         e.feed(b"data: {\"usage\":{\"prompt_tokens\":10}}\n\n");
@@ -282,14 +284,14 @@ mod tests {
     /// 上游可能发回非 JSON 的哨兵或错误文本，不得 panic
     #[test]
     fn ignores_non_json_payloads() {
-        let mut e = SseUsageExtractor::new(openai_spec());
+        let mut e = SseUsageExtractor::new(Arc::new(openai_spec()));
         e.feed(b"data: [DONE]\n\ndata: <html>502</html>\n\n");
         assert!(e.snapshot().is_empty());
     }
 
     #[test]
     fn ignores_missing_fields() {
-        let mut e = SseUsageExtractor::new(openai_spec());
+        let mut e = SseUsageExtractor::new(Arc::new(openai_spec()));
         e.feed(b"data: {\"usage\":{\"completion_tokens\":5}}\n\n");
         let u = e.snapshot();
         assert_eq!(u.get(dims::OUTPUT_TOKENS), 5);
@@ -299,7 +301,7 @@ mod tests {
     /// Last：后到的累计值覆盖先前值
     #[test]
     fn last_mode_overwrites() {
-        let mut e = SseUsageExtractor::new(openai_spec());
+        let mut e = SseUsageExtractor::new(Arc::new(openai_spec()));
         e.feed(b"data: {\"usage\":{\"completion_tokens\":3}}\n\n");
         e.feed(b"data: {\"usage\":{\"completion_tokens\":9}}\n\n");
         assert_eq!(e.snapshot().get(dims::OUTPUT_TOKENS), 9);
@@ -311,7 +313,7 @@ mod tests {
         let spec = UsageSpec::new()
             .rule(dims::OUTPUT_TOKENS, "$.delta.tokens", Accum::Sum)
             .unwrap();
-        let mut e = SseUsageExtractor::new(spec);
+        let mut e = SseUsageExtractor::new(Arc::new(spec));
         e.feed(b"data: {\"delta\":{\"tokens\":2}}\n\n");
         e.feed(b"data: {\"delta\":{\"tokens\":3}}\n\n");
         assert_eq!(e.snapshot().get(dims::OUTPUT_TOKENS), 5);
@@ -321,7 +323,7 @@ mod tests {
     #[test]
     fn works_across_arbitrary_chunk_boundaries() {
         let payload = b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n";
-        let mut e = SseUsageExtractor::new(openai_spec());
+        let mut e = SseUsageExtractor::new(Arc::new(openai_spec()));
         for c in payload.chunks(1) {
             e.feed(c);
         }
@@ -332,7 +334,7 @@ mod tests {
     /// 上游可能把整数写成 JSON 浮点，需接受但不得引入浮点误差
     #[test]
     fn accepts_integral_float() {
-        let mut e = SseUsageExtractor::new(openai_spec());
+        let mut e = SseUsageExtractor::new(Arc::new(openai_spec()));
         e.feed(b"data: {\"usage\":{\"prompt_tokens\":10.0}}\n\n");
         assert_eq!(e.snapshot().get(dims::INPUT_TOKENS), 10);
     }
@@ -345,7 +347,7 @@ mod tests {
     #[case("null")]
     #[case("{}")]
     fn ignores_out_of_range_or_non_numeric(#[case] raw: &str) {
-        let mut e = SseUsageExtractor::new(openai_spec());
+        let mut e = SseUsageExtractor::new(Arc::new(openai_spec()));
         e.feed(format!("data: {{\"usage\":{{\"prompt_tokens\":{raw}}}}}\n\n").as_bytes());
         assert!(e.snapshot().is_empty(), "{raw} 未被忽略");
     }
@@ -365,7 +367,7 @@ mod tests {
     /// 客户端中途断连，携带 usage 的末帧从未到达：按已生成文本估算
     #[test]
     fn estimates_output_tokens_when_usage_never_arrives() {
-        let mut e = SseUsageExtractor::new(spec_with_fallback());
+        let mut e = SseUsageExtractor::new(Arc::new(spec_with_fallback()));
         e.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\" hello\"}}]}\n\n");
         e.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n");
 
@@ -376,7 +378,7 @@ mod tests {
     /// 权威 usage 一旦到达即覆盖估算值，且不再标记为估算
     #[test]
     fn authoritative_usage_overrides_the_estimate() {
-        let mut e = SseUsageExtractor::new(spec_with_fallback());
+        let mut e = SseUsageExtractor::new(Arc::new(spec_with_fallback()));
         e.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\" hello\"}}]}\n\n");
         e.feed(b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":42}}\n\n");
 
@@ -387,7 +389,7 @@ mod tests {
     /// 未配置兜底时保持原样：不估算、不标记
     #[test]
     fn without_fallback_a_truncated_stream_yields_nothing() {
-        let mut e = SseUsageExtractor::new(openai_spec());
+        let mut e = SseUsageExtractor::new(Arc::new(openai_spec()));
         e.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\" hello\"}}]}\n\n");
 
         assert!(e.snapshot().is_empty());
@@ -397,7 +399,7 @@ mod tests {
     /// 空流不产生估算
     #[test]
     fn empty_stream_estimates_nothing() {
-        let e = SseUsageExtractor::new(spec_with_fallback());
+        let e = SseUsageExtractor::new(Arc::new(spec_with_fallback()));
         assert!(e.snapshot().is_empty());
     }
 
@@ -405,7 +407,7 @@ mod tests {
 
     #[test]
     fn extracts_usage_from_a_json_response() {
-        let mut e = JsonUsageExtractor::new(openai_spec());
+        let mut e = JsonUsageExtractor::new(Arc::new(openai_spec()));
         e.feed(b"{\"usage\":{\"prompt_tokens\":10,");
         e.feed(b"\"completion_tokens\":5}}");
 
@@ -417,7 +419,7 @@ mod tests {
     /// 响应未收完即断连，JSON 不完整：抽不出用量但不得 panic
     #[test]
     fn truncated_json_yields_nothing() {
-        let mut e = JsonUsageExtractor::new(openai_spec());
+        let mut e = JsonUsageExtractor::new(Arc::new(openai_spec()));
         e.feed(b"{\"usage\":{\"prompt_tok");
         assert!(e.snapshot().is_empty());
     }

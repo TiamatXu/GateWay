@@ -4,7 +4,7 @@
 //! 本地原子读（准入）→ 主键查询（鉴权）→ 路由 → PG 写（冻结）→ 转发。
 //! 过载时应在最便宜的位置拒绝，而非查库之后。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -18,7 +18,10 @@ use chrono::Utc;
 use futures::TryStreamExt;
 use gw_core::{BillingTiming, ChannelId, ProtocolKind, RequestId};
 use gw_ledger::{Coordinator, HoldRequest, LedgerError};
-use gw_meter::{Accum, JsonUsageExtractor, SseUsageExtractor, Tokenizer, UsageSpec};
+use gw_meter::{
+    Accum, JsonUsageExtractor, RequestTokenCounter, SseUsageExtractor, TextSpec, Tokenizer,
+    UsageSpec,
+};
 use gw_pricing::{PriceCtx, PriceEngine};
 use gw_proxy::{Tee, TeeStream, Upstream, prepare_upstream_headers};
 use http_body_util::{BodyStream, Full};
@@ -117,7 +120,11 @@ impl Reject {
     }
 }
 
-/// M0 的用量抽取规则：OpenAI 兼容协议，硬编码。M2 起由描述文件提供。
+/// 用量抽取规则与输入计数路径。JSONPath 解析一次即可，不在请求路径上重复做。
+/// M1 硬编码 `OpenAI` 兼容协议，M2 起由描述文件提供。
+static USAGE_SPEC: LazyLock<Arc<UsageSpec>> = LazyLock::new(|| Arc::new(openai_usage_spec()));
+static INPUT_SPEC: LazyLock<TextSpec> = LazyLock::new(RequestTokenCounter::openai_chat);
+
 fn openai_usage_spec() -> UsageSpec {
     UsageSpec::new()
         .rule(
@@ -263,6 +270,17 @@ async fn handle(
     // 4. 预扣。
     let request_id = RequestId(Uuid::new_v4());
     let started_at = Utc::now();
+
+    // 客户端提供 Idempotency-Key 时按其去重；否则每请求独立。
+    // 必须按 key_id 隔离，否则一个租户能靠猜键阻塞另一个租户。
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map_or_else(
+            || format!("req:{request_id}"),
+            |v| format!("idem:{}:{v}", principal.key_id.0),
+        );
     let price_ctx = PriceCtx {
         model: &model,
         channel: ChannelId(channel.id),
@@ -270,6 +288,8 @@ async fn handle(
         endpoint: path,
         at: started_at,
         max_output_tokens,
+        // 请求体已在内存中，直接数出真实输入量；取不到时退回配置上限
+        input_tokens: INPUT_SPEC.count(&body),
     };
     let estimate = st.pricing.estimate_max(&price_ctx).await.map_err(|e| {
         tracing::warn!(model = %model, error = %e, "预扣估算失败");
@@ -286,7 +306,7 @@ async fn handle(
             chain: &principal.account_chain,
             amount: estimate,
             ttl: st.config.hold_ttl,
-            idempotency_key: &request_id.to_string(),
+            idempotency_key: &idempotency_key,
             timing: BillingTiming::InRequest,
         })
         .await
@@ -295,6 +315,11 @@ async fn handle(
                 StatusCode::PAYMENT_REQUIRED,
                 "insufficient_quota",
                 "额度不足",
+            ),
+            LedgerError::DuplicateRequest { .. } => reject(
+                StatusCode::CONFLICT,
+                "duplicate_request",
+                "该 Idempotency-Key 对应的请求已完成",
             ),
             other => {
                 tracing::error!(error = %other, "冻结失败");
@@ -360,11 +385,10 @@ async fn handle(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"));
 
-    let spec = openai_usage_spec();
     let extractor: Box<dyn gw_core::UsageExtractor> = if is_sse {
-        Box::new(SseUsageExtractor::new(spec))
+        Box::new(SseUsageExtractor::new(Arc::clone(&USAGE_SPEC)))
     } else {
-        Box::new(JsonUsageExtractor::new(spec))
+        Box::new(JsonUsageExtractor::new(Arc::clone(&USAGE_SPEC)))
     };
     let tee = Arc::new(Mutex::new(Tee::new(extractor)));
     let guard = crate::SettlementGuard::new(hold, Arc::clone(&tee), ctx, Arc::clone(&st.settler));

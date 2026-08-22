@@ -400,7 +400,7 @@ mod tests {
         let spec = UsageSpec::new()
             .rule("output_tokens", "$.usage.completion_tokens", Accum::Last)
             .unwrap();
-        let mut t = Tee::new(Box::new(SseUsageExtractor::new(spec)));
+        let mut t = Tee::new(Box::new(SseUsageExtractor::new(std::sync::Arc::new(spec))));
 
         t.feed(b"data: {\"usage\":{\"completion_tokens\":7}}\n\n");
         t.feed(b"data: {\"usage\":{\"completion_toke");

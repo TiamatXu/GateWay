@@ -51,6 +51,7 @@ fn ctx(model: &str, at: DateTime<Utc>) -> PriceCtx<'_> {
         endpoint: "/v1/chat/completions",
         at,
         max_output_tokens: None,
+        input_tokens: None,
     }
 }
 
@@ -329,6 +330,38 @@ async fn estimate_max_prices_the_worst_case() {
 
     // 输入按上限 128k 估，输出按请求声明的 1000 估
     assert_eq!(est, Money::from_nanos(384_000_000 + 15_000_000));
+}
+
+/// 已知真实输入量时按实际值预扣，不再按上限。
+/// 否则 $3/M 的模型每请求要冻结 $0.384，小额余额用户一个请求都发不出去。
+#[tokio::test]
+async fn estimate_max_uses_the_known_input_size() {
+    let (eng, pool) = engine().await;
+    let m = model();
+    for (dim, price) in [
+        (dims::INPUT_TOKENS, 3 * MILLION * 1000),
+        (dims::OUTPUT_TOKENS, 15 * MILLION * 1000),
+    ] {
+        insert_rule(
+            &pool,
+            Rule {
+                model: Some(&m),
+                endpoint: None,
+                dim,
+                unit_price: price,
+                cost_price: 0,
+                effective_from: at(2020, 1, 1),
+            },
+        )
+        .await;
+    }
+
+    let mut c = ctx(&m, at(2026, 8, 23));
+    c.max_output_tokens = Some(1_000);
+    c.input_tokens = Some(42);
+    let est = eng.estimate_max(&c).await.unwrap();
+
+    assert_eq!(est, Money::from_nanos(3 * 42 * 1000 + 15 * 1_000 * 1000));
 }
 
 /// 请求未声明 `max_tokens` 时按配置的输出上限估算
