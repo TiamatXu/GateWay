@@ -5,8 +5,10 @@
 
 pub mod error;
 pub mod hold;
+pub mod mem;
 pub mod pg;
 
 pub use error::LedgerError;
 pub use hold::{Hold, HoldRequest};
-pub use pg::{Coordinator, PgCoordinator};
+pub use mem::MemCoordinator;
+pub use pg::{AuditMismatch, Coordinator, PgCoordinator};

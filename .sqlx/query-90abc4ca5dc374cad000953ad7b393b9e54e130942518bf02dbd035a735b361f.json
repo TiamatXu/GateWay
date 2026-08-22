@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT b.account_id,\n                      b.held,\n                      COALESCE(SUM(l.amount) FILTER (WHERE h.status = 0), 0)::BIGINT\n                        AS \"active_legs!\"\n                 FROM account_balance b\n                 LEFT JOIN hold_leg l ON l.account_id = b.account_id AND l.shard = b.shard\n                 LEFT JOIN hold h ON h.id = l.hold_id\n                GROUP BY b.account_id, b.held\n               HAVING b.held <> COALESCE(SUM(l.amount) FILTER (WHERE h.status = 0), 0)\n                LIMIT $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "held",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "active_legs!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "90abc4ca5dc374cad000953ad7b393b9e54e130942518bf02dbd035a735b361f"
+}

@@ -25,6 +25,7 @@ metrics = { workspace = true }
 [dev-dependencies]
 gw-store = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

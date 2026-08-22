@@ -257,6 +257,21 @@ mod tests {
         async fn capture_partial(&self, _hold: &Hold, _amt: Money) -> Result<(), LedgerError> {
             Ok(())
         }
+        async fn capture_by_id(&self, _id: gw_core::HoldId, _a: Money) -> Result<(), LedgerError> {
+            Ok(())
+        }
+        async fn void_by_id(&self, _id: gw_core::HoldId) -> Result<(), LedgerError> {
+            Ok(())
+        }
+        async fn reclaim_expired(&self, _limit: i64) -> Result<u64, LedgerError> {
+            Ok(0)
+        }
+        async fn balances(&self, _a: gw_core::AccountId) -> Result<(Money, Money), LedgerError> {
+            Ok((Money::from_nanos(0), Money::from_nanos(0)))
+        }
+        async fn audit(&self, _limit: i64) -> Result<Vec<gw_ledger::AuditMismatch>, LedgerError> {
+            Ok(vec![])
+        }
     }
 
     /// 按 `output_tokens` × 2 纳单位计价

@@ -16,7 +16,7 @@ use gw_gateway::app::{AppState, GatewayConfig};
 use gw_gateway::settlement::Settler;
 use gw_gateway::{CgroupProbe, LoadGuard, PgLogSink, spawn_log_writer};
 use gw_infra::Config;
-use gw_ledger::PgCoordinator;
+use gw_ledger::{Coordinator, PgCoordinator};
 use gw_pricing::{EstimateCeilings, PgPriceEngine};
 use gw_proxy::Upstream;
 use tokio::sync::mpsc;
@@ -146,7 +146,7 @@ fn spawn_load_sampler(
 
 /// 兜底回收：既消费泄漏上报，也定期扫描过期 Hold。
 fn spawn_reclaimer(
-    coord: Arc<PgCoordinator>,
+    coord: Arc<dyn Coordinator>,
     mut leaked: mpsc::Receiver<gw_core::HoldId>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

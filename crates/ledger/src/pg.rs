@@ -33,6 +33,30 @@ pub trait Coordinator: Send + Sync {
     async fn extend(&self, hold: &Hold, delta: Money) -> Result<(), LedgerError>;
     /// 分段扣款但不关闭 Hold：扣 `amount`，冻结额同步减少。
     async fn capture_partial(&self, hold: &Hold, amount: Money) -> Result<(), LedgerError>;
+
+    /// 按 id 结算。句柄已丢失时的兜底路径（泄漏回收、崩溃恢复）。
+    async fn capture_by_id(&self, id: HoldId, actual: Money) -> Result<(), LedgerError>;
+    async fn void_by_id(&self, id: HoldId) -> Result<(), LedgerError>;
+
+    /// TTL 兜底回收：释放已过期仍未结算的 Hold，返回回收数量。
+    async fn reclaim_expired(&self, limit: i64) -> Result<u64, LedgerError>;
+
+    /// 账户当前余额与冻结额，用于对账。
+    async fn balances(&self, account: gw_core::AccountId) -> Result<(Money, Money), LedgerError>;
+
+    /// 对账：返回 `held` 与活跃 Hold 腿之和不一致的账户。
+    /// 这是防死冻结的第七道防线——不一致即告警。
+    async fn audit(&self, limit: i64) -> Result<Vec<AuditMismatch>, LedgerError>;
+}
+
+/// 一处账实不符。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditMismatch {
+    pub account: AccountId,
+    /// `account_balance.held` 记录的值
+    pub held: Money,
+    /// 活跃 Hold 腿的实际之和
+    pub active_legs: Money,
 }
 
 pub struct PgCoordinator {
@@ -46,26 +70,7 @@ impl PgCoordinator {
         Self { pool, reclaimer }
     }
 
-    /// 结算已泄漏的 Hold——句柄已丢失，只能按 id 操作。
-    ///
-    /// # Errors
-    /// Hold 已非活跃状态，或数据库错误。
-    pub async fn capture_by_id(&self, id: HoldId, actual: Money) -> Result<(), LedgerError> {
-        self.settle(id, CAPTURED, ENTRY_CAPTURE, actual.as_nanos())
-            .await
-    }
-
-    /// # Errors
-    /// Hold 已非活跃状态，或数据库错误。
-    pub async fn void_by_id(&self, id: HoldId) -> Result<(), LedgerError> {
-        self.settle(id, VOIDED, ENTRY_VOID, 0).await
-    }
-
-    /// TTL 兜底回收：释放已过期仍未结算的 Hold，返回回收数量。
-    ///
-    /// # Errors
-    /// 数据库错误。
-    pub async fn reclaim_expired(&self, limit: i64) -> Result<u64, LedgerError> {
+    async fn do_reclaim_expired(&self, limit: i64) -> Result<u64, LedgerError> {
         let expired: Vec<Uuid> = sqlx::query_scalar!(
             r#"UPDATE hold SET status = $1, settled_at = now()
                 WHERE id IN (
@@ -215,6 +220,61 @@ fn timing_code(t: BillingTiming) -> i16 {
 
 #[async_trait]
 impl Coordinator for PgCoordinator {
+    async fn capture_by_id(&self, id: HoldId, actual: Money) -> Result<(), LedgerError> {
+        self.settle(id, CAPTURED, ENTRY_CAPTURE, actual.as_nanos())
+            .await
+    }
+
+    async fn void_by_id(&self, id: HoldId) -> Result<(), LedgerError> {
+        self.settle(id, VOIDED, ENTRY_VOID, 0).await
+    }
+
+    async fn reclaim_expired(&self, limit: i64) -> Result<u64, LedgerError> {
+        self.do_reclaim_expired(limit).await
+    }
+
+    async fn audit(&self, limit: i64) -> Result<Vec<AuditMismatch>, LedgerError> {
+        let rows = sqlx::query!(
+            r#"SELECT b.account_id,
+                      b.held,
+                      COALESCE(SUM(l.amount) FILTER (WHERE h.status = 0), 0)::BIGINT
+                        AS "active_legs!"
+                 FROM account_balance b
+                 LEFT JOIN hold_leg l ON l.account_id = b.account_id AND l.shard = b.shard
+                 LEFT JOIN hold h ON h.id = l.hold_id
+                GROUP BY b.account_id, b.held
+               HAVING b.held <> COALESCE(SUM(l.amount) FILTER (WHERE h.status = 0), 0)
+                LIMIT $1"#,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| AuditMismatch {
+                account: AccountId(r.account_id),
+                held: Money::from_nanos(r.held),
+                active_legs: Money::from_nanos(r.active_legs),
+            })
+            .collect())
+    }
+
+    async fn balances(&self, account: AccountId) -> Result<(Money, Money), LedgerError> {
+        let row = sqlx::query!(
+            "SELECT balance, held FROM account_balance WHERE account_id = $1 AND shard = $2",
+            account.0,
+            SHARD
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(
+            row.map_or((Money::from_nanos(0), Money::from_nanos(0)), |r| {
+                (Money::from_nanos(r.balance), Money::from_nanos(r.held))
+            }),
+        )
+    }
+
     async fn hold(&self, req: HoldRequest<'_>) -> Result<Hold, LedgerError> {
         if req.chain.is_empty() {
             return Err(LedgerError::EmptyChain);
@@ -350,19 +410,24 @@ impl Coordinator for PgCoordinator {
         let mut tx = self.pool.begin().await?;
 
         let legs = sqlx::query!(
-            "SELECT account_id, shard FROM hold_leg WHERE hold_id = $1 ORDER BY account_id",
+            "SELECT account_id, shard, amount FROM hold_leg
+              WHERE hold_id = $1 ORDER BY account_id",
             hold.id().0
         )
         .fetch_all(&mut *tx)
         .await?;
 
         for leg in legs {
+            // 扣款可超出冻结额（用量超估算是常态），但释放量以剩余冻结额为限，
+            // 否则 held 会被扣成负数
+            let release = leg.amount.min(charge);
             sqlx::query!(
                 r#"UPDATE account_balance
-                      SET held = held - $3, balance = balance - $3, updated_at = now()
+                      SET held = held - $3, balance = balance - $4, updated_at = now()
                     WHERE account_id = $1 AND shard = $2"#,
                 leg.account_id,
                 leg.shard,
+                release,
                 charge
             )
             .execute(&mut *tx)
@@ -382,14 +447,14 @@ impl Coordinator for PgCoordinator {
 
         // 冻结额同步减少，维持 held == 活跃腿之和
         sqlx::query!(
-            "UPDATE hold_leg SET amount = amount - $2 WHERE hold_id = $1",
+            "UPDATE hold_leg SET amount = GREATEST(amount - $2, 0) WHERE hold_id = $1",
             hold.id().0,
             charge
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
-            "UPDATE hold SET amount = amount - $2 WHERE id = $1 AND status = $3",
+            "UPDATE hold SET amount = GREATEST(amount - $2, 0) WHERE id = $1 AND status = $3",
             hold.id().0,
             charge,
             ACTIVE

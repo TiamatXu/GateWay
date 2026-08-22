@@ -754,6 +754,7 @@ dependencies = [
  "gw-core",
  "gw-store",
  "metrics",
+ "proptest",
  "smallvec",
  "sqlx",
  "thiserror",

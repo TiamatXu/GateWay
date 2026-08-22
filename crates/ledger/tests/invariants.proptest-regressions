@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4881ada31d20ca755dd5a20dad6491a0441e0ecbf7267ab271f2cc15fd3c640b # shrinks to ops = [Hold { account: 0, amount: 1 }, Hold { account: 0, amount: 1 }, Hold { account: 0, amount: 1 }, Hold { account: 0, amount: 1 }, Hold { account: 0, amount: 1 }, HoldChain { child: 2, parent: 2, amount: 1 }, Capture { hold: 0, amount: 0 }, Partial { hold: 13, amount: 3 }, Capture { hold: 10, amount: 0 }, Capture { hold: 2, amount: 0 }]

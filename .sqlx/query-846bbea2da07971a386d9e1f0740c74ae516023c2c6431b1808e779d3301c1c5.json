@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE hold_leg SET amount = amount - $2 WHERE hold_id = $1",
+  "query": "UPDATE hold_leg SET amount = GREATEST(amount - $2, 0) WHERE hold_id = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -11,5 +11,5 @@
     },
     "nullable": []
   },
-  "hash": "d383ef6a703d772bc6c6869e3f003275e29a9da00ddefab4ba4adddf8e77029b"
+  "hash": "846bbea2da07971a386d9e1f0740c74ae516023c2c6431b1808e779d3301c1c5"
 }
