@@ -44,6 +44,11 @@
 
 另需提供一次性数据导入器，把 New API 的 channel / token / user 数据迁入新 schema。
 
+**外部参考（不产生代码依赖）**：
+
+- **AISIX**（api7 开源，Apache 2.0，Rust 原生 AI 网关）。其定位为「无论上游是什么协议，面向客户端的 API 始终保持 OpenAI 形状」，恰是本项目要推翻的假设；且开源版仅有速率与 token 限额，预算控制在其 Cloud 商业版。可参考价值在于其**端点形态清单**（chat / embeddings / rerank / images / audio / videos 提交-轮询-获取 / files / batches / fine_tuning）与**五适配器家族划分**（openai / anthropic / bedrock / vertex / azure-openai），可作为 `EndpointShape` 枚举设计的输入。若借鉴代码需处理 license 归属。
+- **LiteLLM** 已改为 Rust core + Python SDK 架构，印证本项目的语言选型方向。
+
 ---
 
 ## 2. 继承的架构前提
@@ -93,47 +98,102 @@ Rust 在本项目的三个具体红利：
 
 ## 4. 技术栈
 
+### 4.1 依赖选型
+
 | 位置 | 选型 | 理由 |
 |---|---|---|
 | 异步运行时 | `tokio`（多线程调度器） | 事实标准 |
 | HTTP 服务 | `axum` + `tower` | streaming body 一等公民，中间件生态最完整 |
 | 上游客户端（透传） | `hyper` + `hyper-util` legacy client | 必须贴着 hyper，避免高层封装引入 body 缓冲 |
 | 上游客户端（转换） | `reqwest` | 转换路径本就要完整读取 body，高层 API 更省事 |
-| 反向代理 | **自研**（见 §4.1） | Rust 无 `httputil.ReverseProxy` 等价物 |
+| 反向代理 | **自研**（见 §4.3） | Rust 无 `httputil.ReverseProxy` 等价物 |
+| SSE 解析 | `eventsource-stream` | 只做 `byte stream → Event`，不夹带 HTTP 客户端，正是 tee 旁路需要的形态 |
+| JSONPath | `serde_json_path` | RFC 9535 合规，跟随官方 CTS 测试套件；用于描述文件的 usage 提取 |
 | 数据库驱动 | `sqlx`（PostgreSQL） | `query!` 宏在编译期连库校验 SQL 与类型，对账本 SQL 是强正确性保障 |
 | 数据库迁移 | `sqlx::migrate!` | 内建，SQL 文件 embed 进二进制，零额外依赖 |
 | Redis（可选） | `fred` | 异步、连接池、重连；便于用熔断器包裹以实现降级 |
 | 日志 sink | `clickhouse`（默认）／`sqlx` MySQL feature（StarRocks·Doris）／`sqlx` PG（兜底） | 抽象为 `LogSink` trait，见 §5.3 |
 | 序列化 | `serde` + `serde_json`；热点路径可换 `sonic-rs` | 透传路径不解析 JSON，只有转换路径承压 |
-| YAML | `serde_norway`（或 `saphyr`） | ⚠️ `serde_yaml` 已停止维护 |
+| YAML | **`serde-saphyr`** | 见 §4.5——这是全栈唯一没有老牌稳妥选项的位置 |
 | Schema 校验 | `jsonschema` | Provider 描述文件必须有 schema 校验，否则用户写错 YAML 只能在运行时暴露 |
+| 限流 | `governor` | GCRA 令牌桶；限流在节点本地执行，见「配额租约」设计 |
 | 金额表示 | `Money(i64)` newtype，纳单位（1e-9） | 见 §5.2 |
 | 配置加载 | `figment` | 多源合并 + serde 集成 |
 | 日志 / 追踪 | `tracing` + `tracing-subscriber` + `tracing-opentelemetry` | 结构化日志与分布式追踪同源 |
 | 指标 | `metrics` + `metrics-exporter-prometheus` | |
-| Tokenizer | `tiktoken-rs` + 离线 BPE 词表 embed | 严禁运行时下载词表 |
+| Tokenizer | `tiktoken-rs`（OpenAI 系）+ `tokenizers`（HF，开放权重模型），词表离线 embed | 严禁运行时下载词表；覆盖边界见 §4.6 |
+| 认证 | `openidconnect` / `ldap3` / `jsonwebtoken` / `argon2` | 企业 SSO 与后台登录 |
 | WASM hook（后期） | `wasmtime` | |
 | 测试 | `rstest` + `proptest` + `testcontainers` + `loom` | proptest 断言「余额守恒」不变量；loom 验证账本并发 |
 | 前端 | React + Vite + Semi Design | 沿用 New API 的前端技术栈；产物用 `rust-embed` 嵌入二进制 |
 | 后台作业 | tokio 定时任务 + `pg_advisory_lock` + `FOR UPDATE SKIP LOCKED` | 引入 Asynq 类方案等于强依赖 Redis，与「无 Redis 降级」矛盾 |
 
-### 4.1 需要自研的部分
+### 4.2 生态盘点结论
 
-Rust 生态在以下位置没有可直接使用的组件，均需自行实现。这些是本项目的核心工程量所在：
+已对全部所需能力做过生态核查。结论是：**Rust 生态在基础设施层全部有成熟件，缺口集中在业务编排层**——也就是本项目真正的价值所在。不存在因生态缺失而阻塞的能力。
 
-1. **流式反向代理**。`Body → Stream → hyper client → Stream → Body`，全程零拷贝、零缓冲。在 axum 中实现比 Go 的 `ReverseProxy` 定制更直接，因为不需要绕过框架对 `ResponseWriter` 的包装。
-2. **动态 dispatcher**。本网关的路由不是静态路由：需按「协议规范 + 端点形态」匹配，并支持整段通配透传（如 `/v1/*`）。框架 router 只负责最外层挂载。
-3. **SSE tee 旁路**。在流经时增量解析 SSE 帧抽取 usage，同时不阻塞、不缓冲下游转发；客户端中途断连时需按已生成部分结算。
+唯一的生态风险点是 YAML 解析库（§4.5），需在 M2 动工前实测确认。
+
+### 4.3 需要自研的部分
+
+以下位置社区无可直接使用的组件，或有但不适用。这些构成本项目的核心工程量：
+
+1. **流式反向代理**。`Body → Stream → hyper client → Stream → Body`，全程零拷贝、零缓冲。
+2. **动态 dispatcher**。路由需按「协议规范 + 端点形态」匹配，并支持整段通配透传（如 `/v1/*`）。框架 router 只负责最外层挂载。
+3. **SSE tee 旁路**。`eventsource-stream` 提供帧解析，但「边转发边增量抽取 usage、且不阻塞不缓冲下游」的编排需自研；客户端中途断连时需按已生成部分结算。
 4. **Coordinator 的 PG 实现**。原子冻结语句、热点账户分片、配额租约与回收、双模式（严格/租约）切换。
 5. **Provider 描述文件的 schema 与解释器**。
-6. **用量提取引擎**。JSONPath 取值 + SSE 增量聚合 + tokenizer 兜底的组合。
-7. **轻量 job scheduler**。基于 advisory lock 保证单实例执行的巡检任务框架。
+6. **用量提取引擎**。JSONPath 取值、SSE 增量聚合、tokenizer 兜底三者的编排——零件齐备，编排自研。
+7. **价格规则引擎**。规则匹配、阶梯、版本快照、explain。
+8. **虚拟句柄映射与异步任务状态机**。
+9. **轻量 job scheduler**。基于 advisory lock 保证单实例执行的巡检任务框架。
+10. **`proto` 规范协议类型定义**。见 §4.4。
+11. **优雅退出与连接排空**。SIGTERM 后停止接受新请求、等待在途流自然结束、归还本节点持有的全部租约。
 
-### 4.2 生态注意事项
+### 4.4 已评估并否决的方案
 
-- `serde_yaml` 已停止维护，必须使用 fork 或替代实现。
+**Pingora（Cloudflare 开源代理框架）。** 生产验证极充分——每秒 4000 万请求运行数年——并提供连接池、负载均衡、健康检查、TLS 及零停机优雅重载。否决理由有三：
+
+- 它解决的是本项目最不痛的部分。连接池 hyper 自带；负载均衡本就需按渠道健康度自定义，用不上通用实现。核心复杂度在计费、句柄映射、描述文件驱动，这些 Pingora 无法覆盖。
+- 它是框架而非库，会绑定整个数据平面的编程模型。控制平面必然使用 axum，两套框架并存使认知成本翻倍。
+- 官方定位明确：其适用场景是「CPU 效率成为账单项」的规模。本项目不在该量级。其缓存相关 API 目前仍标注为 experimental 且高度不稳定。
+
+**代价**：放弃零停机优雅重载。对 SSE 流可达 10 分钟的网关这有实际价值，但 K8s 滚动更新可覆盖多数场景；裸机部署的开源用户无法受益。接受此取舍。
+
+**`async-openai` 作为 `proto` crate 的依赖。** 该 crate 支持 `serde(flatten)` 扩展与 `byot`（bring your own types）feature，可容纳未知字段。否决理由：它为「调用 OpenAI」设计，而非「无损转发任意 OpenAI 兼容厂商请求」。本架构要求每个类型携带 `#[serde(flatten)] extra` 与原始 body 副本，这是一等公民要求而非可选扩展；且它仅覆盖 OpenAI，Anthropic / Gemini 的规范协议仍需自写。更关键的是，依赖第三方类型定义等于将协议演进速度交予上游发版节奏。
+
+**结论**：`proto` 自行定义，将 `async-openai` 用作字段清单的参考而非依赖。
+
+### 4.5 生态风险：YAML 解析库
+
+这是全栈唯一没有老牌稳妥选项的位置，需显式管理：
+
+- `serde_yaml` 已停止维护
+- 社区曾转向 `serde_yml`，但该项目**因 unsoundness 问题被 archive**，并有对应安全公告
+- `serde_norway` 是维护中的 fork，但**依赖 `unsafe-libyaml`**，与本 workspace `unsafe_code = "forbid"` 的规约精神冲突
+- **`serde-saphyr`** 为当前最优解：现代解析器、serde 集成、无 Value DOM、纯 Rust 内存安全
+
+**缓解措施**：在 M2（Provider 描述层）动工前，先用真实的 Provider 描述文件对 `serde-saphyr` 做一次实测（含 merge key、嵌套枚举、锚点引用等特性）。若不满足，退回 `yaml-rust2`（低层解析器，自行对接 serde）。此项列为已识别技术风险。
+
+### 4.6 用量计量的生态边界与兜底策略
+
+生态边界是硬事实：`tiktoken-rs` 仅覆盖 OpenAI 系；`tokenizers` 覆盖开放权重模型；**Anthropic 与 Gemini 的 tokenizer 不公开**，官方给出的方案是调用其 `count_tokens` API。
+
+因此用量获取分三档，优先级由高到低：
+
+| 档位 | 条件 | 做法 |
+|---|---|---|
+| 1 | 上游响应返回 usage | 直接采用。覆盖绝大多数情况 |
+| 2 | 上游不返回，但厂商提供 `count_tokens` API | 调用校准，**异步回填，不阻塞请求** |
+| 3 | 两者皆无 | 用 tiktoken 对应编码估算 |
+
+**第 3 档必须在账单记录上标记 `estimated = true`，并在 explain 接口中明示该笔为估算值。** 这是产品决策而非纯技术选择：缺少此标记，计费争议将无法追溯举证。
+
+### 4.7 其他实现注意
+
 - `sqlx` 需提交 `.sqlx/` 离线元数据目录，保证 CI 与无数据库环境可编译。
 - tokenizer 词表必须 embed 进二进制，不可运行时下载。
+- StarRocks 路径下 `sqlx` 的 `query!` 编译期校验不可用（`information_schema` 差异），需退回运行时 `query()` API。
 
 ---
 
@@ -183,7 +243,7 @@ newtype 包装为零成本，同时禁止裸 `i64` 混入金额运算。
 
 **已评估并否决：将 StarRocks 设为唯一后端。** 其主键模型支持实时 UPSERT，看似契合「异步任务日志需回填终态」的场景。但任务的权威状态本就应存于 PostgreSQL——Hold 的生命周期挂在任务对象上，必须与账本同库同事务——日志侧只需在终态写入一条计费记录，更新需求不成立。StarRocks 的 JOIN 能力优于 ClickHouse 的 Dictionary 维表方案，但不足以抵消部署重量的差距。
 
-**实现注意**：sqlx 的 `query!` 编译期校验依赖 `information_schema`，StarRocks 与 MySQL 存在差异，该路径需退回运行时 `query()` API。日志写入的 SQL 结构简单，可以接受。
+**实现注意**见 §4.7。
 
 ---
 
@@ -262,7 +322,7 @@ gateway/
 |---|---|
 | Edition / MSRV | Rust 2024 edition；MSRV 设为「当前 stable 往前两个版本」，随工具链滚动更新 |
 | 错误处理 | 库 crate 用 `thiserror` 定义具体错误类型；`bin` 顶层用 `anyhow`。网关错误类型**必须能携带上游原始响应体**——错误同样需要按出站协议格式化后返回客户端 |
-| unsafe | 全 workspace `unsafe_code = "forbid"` |
+| unsafe | 全 workspace `unsafe_code = "forbid"`。该约束仅作用于本项目自有 crate，不传递至第三方依赖；但在同等条件下优先选择纯 Rust 实现（如 §4.5 的 YAML 库选型） |
 | lint | `clippy::pedantic` 选择性开启；CI 使用 `-D warnings` |
 | 依赖版本 | 全部在 `[workspace.dependencies]` 声明，子 crate 仅写 `.workspace = true` |
 | 构建加速 | `mold` linker + `cargo-nextest` + `sccache`，从第一天配置 |
