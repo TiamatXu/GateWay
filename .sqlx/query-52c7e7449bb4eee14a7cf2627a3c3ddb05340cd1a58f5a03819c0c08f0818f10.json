@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT balance - held AS \"available!\" FROM account_balance\n            WHERE account_id = $1 AND shard = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "available!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int2"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "52c7e7449bb4eee14a7cf2627a3c3ddb05340cd1a58f5a03819c0c08f0818f10"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT account_id FROM hold_leg WHERE hold_id = $1 ORDER BY depth",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ec7b3c74c1bd97b1907c80fc9560ca991b5b2703e27e01fa5acab9f168dc443e"
+}

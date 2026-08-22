@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE hold SET status = $1, settled_at = now()\n                WHERE id IN (\n                    SELECT id FROM hold\n                     WHERE status = $2 AND expires_at <= now()\n                     ORDER BY expires_at\n                     LIMIT $3\n                     FOR UPDATE SKIP LOCKED)\n               RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int2",
+        "Int2",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "64d871fe9a9f5debc44d1fa03c3b1015b270fb48cdfc3806376c22feda847f8a"
+}

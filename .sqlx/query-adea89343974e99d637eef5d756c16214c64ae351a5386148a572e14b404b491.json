@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE account_balance SET held = held + $3, updated_at = now()\n            WHERE account_id = $1 AND shard = $2 AND balance - held >= $3\n           RETURNING balance - held AS \"available!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "available!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int2",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "adea89343974e99d637eef5d756c16214c64ae351a5386148a572e14b404b491"
+}
