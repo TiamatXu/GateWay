@@ -177,6 +177,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gw-gateway"
+version = "0.1.0"
+dependencies = [
+ "gw-core",
+ "rstest",
+]
+
+[[package]]
 name = "gw-meter"
 version = "0.1.0"
 dependencies = [
