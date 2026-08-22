@@ -200,6 +200,45 @@ impl UsageExtractor for SseUsageExtractor {
     }
 }
 
+/// 从非流式 JSON 响应中抽取用量。整段缓冲后解析——单次响应体量有限。
+#[derive(Debug)]
+pub struct JsonUsageExtractor {
+    spec: UsageSpec,
+    buf: Vec<u8>,
+}
+
+impl JsonUsageExtractor {
+    #[must_use]
+    pub fn new(spec: UsageSpec) -> Self {
+        Self {
+            spec,
+            buf: Vec::new(),
+        }
+    }
+
+    fn parse(&self) -> UsageVector {
+        let mut usage = UsageVector::new();
+        if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&self.buf) {
+            self.spec.apply(&doc, &mut usage);
+        }
+        usage
+    }
+}
+
+impl UsageExtractor for JsonUsageExtractor {
+    fn feed(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    fn snapshot(&self) -> UsageVector {
+        self.parse()
+    }
+
+    fn finish(self: Box<Self>) -> UsageVector {
+        self.parse()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +398,27 @@ mod tests {
     #[test]
     fn empty_stream_estimates_nothing() {
         let e = SseUsageExtractor::new(spec_with_fallback());
+        assert!(e.snapshot().is_empty());
+    }
+
+    // ------------------------------------------------------- 非流式 JSON
+
+    #[test]
+    fn extracts_usage_from_a_json_response() {
+        let mut e = JsonUsageExtractor::new(openai_spec());
+        e.feed(b"{\"usage\":{\"prompt_tokens\":10,");
+        e.feed(b"\"completion_tokens\":5}}");
+
+        let u = Box::new(e).finish();
+        assert_eq!(u.get(dims::INPUT_TOKENS), 10);
+        assert_eq!(u.get(dims::OUTPUT_TOKENS), 5);
+    }
+
+    /// 响应未收完即断连，JSON 不完整：抽不出用量但不得 panic
+    #[test]
+    fn truncated_json_yields_nothing() {
+        let mut e = JsonUsageExtractor::new(openai_spec());
+        e.feed(b"{\"usage\":{\"prompt_tok");
         assert!(e.snapshot().is_empty());
     }
 

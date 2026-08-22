@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ON (dim)\n                      id, dim, unit_price, cost_price, version\n                 FROM price_rule\n                WHERE (match_model    IS NULL OR match_model    = $1)\n                  AND (match_channel  IS NULL OR match_channel  = $2)\n                  AND (match_tier     IS NULL OR match_tier     = $3)\n                  AND (match_endpoint IS NULL OR match_endpoint = $4)\n                  AND effective_from <= $5\n                ORDER BY dim,\n                         (match_model    IS NOT NULL)::int\n                       + (match_channel  IS NOT NULL)::int\n                       + (match_tier     IS NOT NULL)::int\n                       + (match_endpoint IS NOT NULL)::int DESC,\n                         effective_from DESC,\n                         id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "dim",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "unit_price",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "cost_price",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4351a0d007168920e4f62244a71b2a0c1730b404885d0ff830739b24fb7b24a1"
+}

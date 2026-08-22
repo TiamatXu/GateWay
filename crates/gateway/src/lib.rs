@@ -1,11 +1,15 @@
 //! 数据平面：鉴权、准入、dispatcher、生命周期编排。
 
 pub mod admission;
+pub mod app;
+pub mod auth;
 pub mod probe;
 pub mod protocol_error;
 pub mod settlement;
 
 pub use admission::{Admission, LoadGuard, LoadGuardConfig, LoadSample, RejectReason, Signal};
+pub use app::{AppState, GatewayConfig, router};
+pub use auth::{AuthError, Principal, authenticate, extract_bearer, key_hash, key_prefix};
 pub use probe::{CgroupProbe, LoadProbe};
 pub use protocol_error::error_body;
 pub use settlement::{SettlementCtx, SettlementGuard, Settler};
