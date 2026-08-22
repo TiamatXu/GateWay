@@ -14,10 +14,19 @@ serde_json = "1"
 http = "1"
 smol_str = { version = "0.3", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
+async-trait = "0.1"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+smallvec = { version = "1", features = ["serde", "union"] }
+tracing = "0.1"
+metrics = "0.24"
 rstest = "0.25"
 proptest = "1"
 serde_json_path = "0.7"
 gw-core = { path = "crates/core" }
+gw-store = { path = "crates/store" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
