@@ -44,6 +44,18 @@ impl Hold {
         }
     }
 
+    /// 构造一个不对应任何数据库行的 Hold，仅供测试替身使用。
+    #[cfg(feature = "testkit")]
+    pub fn stub(amount: Money, reclaimer: mpsc::Sender<HoldId>) -> Self {
+        Self::new(
+            HoldId(uuid::Uuid::new_v4()),
+            SmallVec::new(),
+            amount,
+            Utc::now(),
+            reclaimer,
+        )
+    }
+
     #[must_use]
     pub fn id(&self) -> HoldId {
         self.id
@@ -65,6 +77,12 @@ impl Hold {
     }
 
     pub(crate) fn mark_consumed(&mut self) {
+        self.consumed = true;
+    }
+
+    /// 供测试替身在不落库的情况下消费 Hold。
+    #[cfg(feature = "testkit")]
+    pub fn mark_settled_for_test(&mut self) {
         self.consumed = true;
     }
 }

@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+use crate::ProviderId;
+
+/// 规范协议。`Native` 用于客户端直接使用厂商私有协议的情形——
+/// 这是透传优先架构的常态，不是例外。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolKind {
+    OpenAiChat,
+    OpenAiResponses,
+    AnthropicMessages,
+    GeminiGenerateContent,
+    Native(ProviderId),
+}
+
 /// 端点形态。五个维度正交，是**有限集合**，由 `core` 建模；
 /// 端点身份是开放集合，由描述文件表达。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

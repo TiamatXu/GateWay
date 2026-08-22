@@ -12,6 +12,7 @@ pub use ids::{AccountId, ApiKeyId, ChannelId, HandleId, HoldId, NodeId, Provider
 pub use money::Money;
 pub use redact::HeaderRedactor;
 pub use shape::{
-    BillingTiming, EndpointShape, HandleKind, HandleRole, RequestForm, ResponseForm, RetryPolicy,
+    BillingTiming, EndpointShape, HandleKind, HandleRole, ProtocolKind, RequestForm, ResponseForm,
+    RetryPolicy,
 };
 pub use usage::{UsageDim, UsageVector, dims};

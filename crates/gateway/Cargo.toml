@@ -8,9 +8,27 @@ publish.workspace = true
 
 [dependencies]
 gw-core = { workspace = true }
+gw-ledger = { workspace = true }
+gw-pricing = { workspace = true }
+gw-proxy = { workspace = true }
+gw-meter = { workspace = true }
+gw-store = { workspace = true }
+serde_json = { workspace = true }
+http = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+uuid = { workspace = true }
+smallvec = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+gw-ledger = { workspace = true, features = ["testkit"] }
 
 [lints]
 workspace = true
