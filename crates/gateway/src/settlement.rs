@@ -7,10 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
-use gw_core::{ChannelId, Money, RequestId, UsageVector};
+use gw_core::{AccountId, ApiKeyId, ChannelId, Money, RequestId, UsageVector};
 use gw_ledger::{Coordinator, Hold};
 use gw_pricing::{PriceCtx, PriceEngine};
 use gw_proxy::SharedTee;
+use http::HeaderMap;
+use smallvec::SmallVec;
 use tokio::sync::mpsc;
 use tokio_util::task::TaskTracker;
 
@@ -26,6 +28,8 @@ pub enum RequestStatus {
 #[derive(Debug, Clone)]
 pub struct RequestRecord {
     pub request_id: RequestId,
+    pub key_id: Option<ApiKeyId>,
+    pub account_chain: SmallVec<[AccountId; 4]>,
     pub model: String,
     pub channel: ChannelId,
     pub endpoint: String,
@@ -34,6 +38,10 @@ pub struct RequestRecord {
     pub status: RequestStatus,
     /// 用量为 tokenizer 估算值。explain 接口须明示。
     pub estimated: bool,
+    /// 已脱敏
+    pub req_headers: HeaderMap,
+    /// 已脱敏
+    pub resp_headers: HeaderMap,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
 }
@@ -41,11 +49,17 @@ pub struct RequestRecord {
 #[derive(Debug, Clone)]
 pub struct SettlementCtx {
     pub request_id: RequestId,
+    pub key_id: Option<ApiKeyId>,
+    pub account_chain: SmallVec<[AccountId; 4]>,
     pub model: String,
     pub channel: ChannelId,
     pub tier: String,
     pub endpoint: String,
     pub started_at: DateTime<Utc>,
+    /// 已脱敏
+    pub req_headers: HeaderMap,
+    /// 已脱敏
+    pub resp_headers: HeaderMap,
 }
 
 /// 结算执行者。进程级单例，由 app state 持有。
@@ -128,6 +142,8 @@ impl Settler {
 
         self.deliver_log(RequestRecord {
             request_id: ctx.request_id,
+            key_id: ctx.key_id,
+            account_chain: ctx.account_chain,
             model: ctx.model,
             channel: ctx.channel,
             endpoint: ctx.endpoint,
@@ -135,6 +151,8 @@ impl Settler {
             amount,
             status,
             estimated,
+            req_headers: ctx.req_headers,
+            resp_headers: ctx.resp_headers,
             started_at: ctx.started_at,
             ended_at: Utc::now(),
         });
@@ -322,6 +340,10 @@ mod tests {
     fn ctx() -> SettlementCtx {
         SettlementCtx {
             request_id: RequestId(uuid::Uuid::new_v4()),
+            key_id: None,
+            account_chain: smallvec::SmallVec::new(),
+            req_headers: http::HeaderMap::new(),
+            resp_headers: http::HeaderMap::new(),
             model: "gpt-4o".into(),
             channel: ChannelId(1),
             tier: "default".into(),

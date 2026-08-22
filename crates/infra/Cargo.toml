@@ -1,0 +1,20 @@
+[package]
+name = "gw-infra"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+figment = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+figment = { workspace = true, features = ["test"] }
+
+[lints]
+workspace = true

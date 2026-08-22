@@ -1,0 +1,27 @@
+[package]
+name = "gw-bin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+gw-core = { workspace = true }
+gw-infra = { workspace = true }
+gw-gateway = { workspace = true }
+gw-ledger = { workspace = true }
+gw-pricing = { workspace = true }
+gw-proxy = { workspace = true }
+gw-store = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+
+[lints]
+workspace = true

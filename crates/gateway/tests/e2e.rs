@@ -84,10 +84,7 @@ struct Fixture {
     account: i64,
     api_key: String,
     model: String,
-    _keepalive: (
-        mpsc::Receiver<gw_core::HoldId>,
-        mpsc::Receiver<gw_gateway::settlement::RequestRecord>,
-    ),
+    _keepalive: mpsc::Receiver<gw_core::HoldId>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -164,6 +161,12 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
 
     let (reclaim_tx, reclaim_rx) = mpsc::channel(64);
     let (log_tx, log_rx) = mpsc::channel(1024);
+    drop(gw_gateway::spawn_log_writer(
+        Box::new(gw_gateway::PgLogSink::new(pool.clone())),
+        log_rx,
+        16,
+        Duration::from_millis(20),
+    ));
 
     let load = Arc::new(LoadGuard::new(LoadGuardConfig {
         max_inflight,
@@ -184,6 +187,7 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
 
     let state = Arc::new(AppState {
         pool: pool.clone(),
+        redactor: gw_core::HeaderRedactor::default(),
         load: Arc::clone(&load),
         coord,
         pricing,
@@ -209,7 +213,7 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
         account,
         api_key,
         model,
-        _keepalive: (reclaim_rx, log_rx),
+        _keepalive: reclaim_rx,
     }
 }
 
@@ -282,6 +286,50 @@ async fn bills_a_non_streaming_request() {
     let (balance, held) = fx.settled().await;
     assert_eq!(held, 0);
     assert_eq!(balance, START_BALANCE - 15);
+}
+
+/// 账单落库，且密钥类头绝不出现在日志中
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_a_billing_record_with_redacted_headers() {
+    let fx = setup(START_BALANCE, 64).await;
+
+    let resp = fx
+        .request("/v1/chat/completions", true)
+        .send()
+        .await
+        .unwrap();
+    resp.text().await.unwrap();
+    fx.settled().await;
+
+    let row = loop {
+        let row: Option<(String, serde_json::Value, serde_json::Value, i16)> = sqlx::query_as(
+            "SELECT model, usage, req_headers, status FROM request_log
+              WHERE model = $1 ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&fx.model)
+        .fetch_optional(&fx.pool)
+        .await
+        .unwrap();
+        if let Some(r) = row {
+            break r;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    };
+
+    assert_eq!(row.1["input_tokens"], 10);
+    assert_eq!(row.1["output_tokens"], 5);
+    assert_eq!(row.3, 0);
+
+    let headers = row.2.as_object().unwrap();
+    assert!(
+        !headers.contains_key("authorization"),
+        "密钥类头出现在了请求日志中：{headers:?}"
+    );
+    assert!(headers.contains_key("content-type"), "普通头被误删");
+    assert!(
+        !row.2.to_string().contains(&fx.api_key),
+        "API Key 明文出现在了请求日志中"
+    );
 }
 
 // ------------------------------------------------------------------ 验收项 2

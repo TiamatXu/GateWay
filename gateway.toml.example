@@ -1,0 +1,24 @@
+# 网关配置。所有项都可用环境变量覆盖：GW_ 前缀，嵌套段落用 __ 分隔。
+# 例：GW_DATABASE_URL、GW_LOAD__ENTER_RATIO
+
+listen = "0.0.0.0:3000"
+database_url = "postgres://postgres:gwdev@localhost:5433/gateway"
+db_max_connections = 32
+
+[load]
+# 每个在途流的内存预算。并发上限 = 内存 limit × safety_factor / 该值
+per_stream_budget_bytes = 65536
+safety_factor = 0.7
+# 显式并发上限；为 0 时按内存预算推导
+max_inflight = 0
+# 滞回：进入拒绝态 90%，退出 80%
+enter_ratio = 0.90
+exit_ratio = 0.80
+window = 8
+retry_after_secs = 3
+sample_interval_ms = 500
+
+[log]
+channel_capacity = 4096
+batch_size = 256
+flush_interval_ms = 500

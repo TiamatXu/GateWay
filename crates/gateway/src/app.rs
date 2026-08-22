@@ -48,6 +48,7 @@ impl Default for GatewayConfig {
 
 pub struct AppState {
     pub pool: PgPool,
+    pub redactor: gw_core::HeaderRedactor,
     pub load: Arc<LoadGuard>,
     pub coord: Arc<dyn Coordinator>,
     pub pricing: Arc<dyn PriceEngine>,
@@ -322,15 +323,6 @@ async fn handle(
         })?;
     *req.headers_mut() = prepare_upstream_headers(headers, credential.as_deref());
 
-    let ctx = SettlementCtx {
-        request_id,
-        model,
-        channel: ChannelId(channel.id),
-        tier: "default".into(),
-        endpoint: path.to_owned(),
-        started_at,
-    };
-
     let upstream_resp = match st.upstream.send(req).await {
         Ok(r) => r,
         Err(e) => {
@@ -347,7 +339,20 @@ async fn handle(
         }
     };
 
-    // 6. tee 旁路 + 结算哨兵。
+    // 6. tee 旁路 + 结算哨兵。响应头此时才可知，故在此构造结算上下文。
+    let ctx = SettlementCtx {
+        request_id,
+        key_id: Some(principal.key_id),
+        account_chain: principal.account_chain,
+        model,
+        channel: ChannelId(channel.id),
+        tier: "default".into(),
+        endpoint: path.to_owned(),
+        started_at,
+        req_headers: st.redactor.redact(headers),
+        resp_headers: st.redactor.redact(upstream_resp.headers()),
+    };
+
     let is_sse = streaming
         || upstream_resp
             .headers()
