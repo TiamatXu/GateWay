@@ -190,7 +190,18 @@ pub struct Quote {
 }
 ```
 
-`estimate_max` 供准入时的最坏情况预扣使用。
+```rust
+pub struct PriceCtx<'a> {
+    pub model: &'a str,
+    pub channel: ChannelId,
+    pub tier: &'a str,
+    pub endpoint: &'a str,
+    pub at: DateTime<Utc>,          // 用于时段规则与版本快照
+    pub max_output_tokens: Option<u32>,
+}
+```
+
+`estimate_max` 供准入时的最坏情况预扣使用；`at` 同时决定命中哪个价格版本，改价不影响历史账单。
 
 ### 3.5 其余 trait
 
@@ -272,16 +283,24 @@ CREATE TABLE account_balance (
 
 CREATE TABLE hold (
     id              UUID PRIMARY KEY,
-    account_id      BIGINT NOT NULL,
-    shard           SMALLINT NOT NULL,
     amount          BIGINT NOT NULL,
     timing          SMALLINT NOT NULL,
-    idempotency_key TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
     expires_at      TIMESTAMPTZ NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (idempotency_key)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX hold_expires_idx ON hold (expires_at);
+
+-- 一个 Hold 在账户链上的每一级各占一行。M0 恒为一行，M1 起可多行。
+CREATE TABLE hold_leg (
+    hold_id    UUID     NOT NULL REFERENCES hold(id) ON DELETE CASCADE,
+    account_id BIGINT   NOT NULL,
+    shard      SMALLINT NOT NULL,
+    amount     BIGINT   NOT NULL,
+    depth      SMALLINT NOT NULL,      -- 0 = 链首，主计费主体
+    PRIMARY KEY (hold_id, account_id)
+);
+CREATE INDEX hold_leg_account_idx ON hold_leg (account_id);
 
 CREATE TABLE quota_lease (
     lease_id   UUID PRIMARY KEY,
@@ -329,8 +348,8 @@ CREATE TABLE price_rule (
     match_tier     TEXT,
     match_endpoint TEXT,
     dim            TEXT NOT NULL,
-    unit_price     BIGINT NOT NULL,   -- 纳单位每单位用量
-    cost_price     BIGINT NOT NULL,
+    unit_price     BIGINT NOT NULL,   -- 纳单位 per 百万用量单位
+    cost_price     BIGINT NOT NULL,   -- 同上
     effective_from TIMESTAMPTZ NOT NULL
 );
 
@@ -338,6 +357,10 @@ CREATE TABLE config_version (id INT PRIMARY KEY DEFAULT 1, version BIGINT NOT NU
 ```
 
 `api_key.account_chain` 是物化列，组织树或 Account 绑定变更时批量重算。
+
+`hold` 与 `hold_leg` 分离是嵌套额度的前提：一次冻结在账户链的每一级各占一个 leg，单事务内全部写入，全成或全败。M0 恒为单 leg，但表结构与写入路径按最终形态实现，M1 只需放开链长限制。
+
+`unit_price` 的单位是**纳单位 per 百万用量单位**，而非 per 单位。原因是精度：厂商定价普遍以百万 token 为基准（如 $3/M tokens），若按 per token 存储，低价模型会损失有效数字。按百万为基准时 $3/M 直接存为 `3_000_000_000`，两端都无精度损失。
 
 ---
 
@@ -374,13 +397,14 @@ struct SettlementGuard {
     hold: Option<Hold>,
     extractor: Arc<Mutex<Box<dyn UsageExtractor>>>,
     ctx: SettlementCtx,
+    settle_tasks: TaskTracker,      // 进程级，由 app state 持有
 }
 
 impl Drop for SettlementGuard {
     fn drop(&mut self) {
         if let Some(hold) = self.hold.take() {
             let (extractor, ctx) = (self.extractor.clone(), self.ctx.clone());
-            SETTLE_TASKS.spawn(async move { settle(hold, extractor, ctx).await });
+            self.settle_tasks.spawn(async move { settle(hold, extractor, ctx).await });
         }
     }
 }
@@ -390,7 +414,7 @@ impl Drop for SettlementGuard {
 
 **两处必须处理**：
 
-1. `Drop` 中不能 await，只能 spawn。因此结算任务统一注册到 `SETTLE_TASKS`（一个 `JoinSet`），**优雅退出时必须等待其排空**，否则关机瞬间断连的请求会漏账。
+1. `Drop` 中不能 await，只能 spawn。因此结算任务统一注册到进程级的 `TaskTracker`（由 app state 持有并注入，不用全局 static），**优雅退出时必须等待其排空**，否则关机瞬间断连的请求会漏账。
 2. `TeeStream` 的 `feed` 与转发同步执行，不得引入额外 await 点或锁竞争，否则会拖慢转发延迟。
 
 ---
