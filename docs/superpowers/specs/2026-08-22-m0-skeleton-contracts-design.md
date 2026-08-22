@@ -381,8 +381,11 @@ CREATE TABLE config_version (id INT PRIMARY KEY DEFAULT 1, version BIGINT NOT NU
                  usage = extractor.snapshot()
                  quote = PriceEngine::quote(ctx, usage)
                  Coordinator::capture(hold, quote.amount)
-9. 落账      LogSink::write(RequestRecord)
+                 → RequestRecord 投递到日志通道（非阻塞）
+9. 落账      独立的批量写入任务消费日志通道 → LogSink::write
 ```
+
+**第 8、9 步必须是两条独立通道。** capture 关系到钱，要求可靠且及时；日志可以批量、可以延迟、极端情况可以丢弃。若共用一个任务，慢 sink（如 ClickHouse 抖动）会拖累 capture。日志投递对结算路径非阻塞——通道满时丢弃并计数告警，绝不反压到结算。
 
 第 4 步的 `SettlementGuard` 是整条链路的核心——它保证第 8 步在任何终止路径下都会发生。
 
@@ -428,6 +431,7 @@ impl Drop for SettlementGuard {
 | 断连 | 客户端在流中途 drop，验证结算金额等于已生成部分 | mock 上游 SSE |
 | 账本 | `held == SUM(活跃 Hold)` 不变量 | `proptest` |
 | 泄漏 | `Hold` 未消费即 drop，验证指标上报与回收队列投递 | 单元 |
+| 通道隔离 | `LogSink` 阻塞时 capture 不受影响 | 集成 |
 
 SSE extractor 的跨 chunk 断帧测试必须覆盖——真实网络下 SSE 帧被任意切分，这是最容易出 bug 且最难在生产中发现的地方。
 
@@ -462,5 +466,7 @@ SSE extractor 的跨 chunk 断帧测试必须覆盖——真实网络下 SSE 帧
 
 ## 10. 待确认
 
-1. M0 选用的上游厂商与模型（需要一个真实可调用的 OpenAI 兼容端点）
-2. `SETTLE_TASKS` 的并发上限与背压策略——结算任务积压时是阻塞还是丢弃并告警
+1. M0 的上游按 OpenAI 兼容协议的官方文档实现，不预先绑定具体厂商。实现完成后向用户索取真实的请求与响应样本用于核对——尤其是 SSE 的帧格式与 usage 字段位置，文档与实际返回常有出入。
+2. ~~结算任务的背压策略~~ — **已明确**。M0 不会积压：结算任务的产生速率等于请求完成速率，消费速率受限于 PG 写入，而每个请求在准入时本已做过一次 `hold`（同为 PG 写），两者同数量级；PG 变慢时 `hold` 一并变慢、请求被拒，系统自限。
+
+   **M1 起需要处理**：配额租约使 `hold` 走本地内存不再碰 PG，而 `capture` 仍须写 PG，产生与消费速率就此脱钩。届时的处理是——暴露 `settle_queue_depth` 指标并告警，设上限作为最后保护，触发时阻塞准入而非丢弃（丢弃的是钱）。此项列入 M1 交付。
