@@ -22,6 +22,10 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 smallvec = { version = "1", features = ["serde", "union"] }
 tracing = "0.1"
 metrics = "0.24"
+bytes = "1"
+futures-core = "0.3"
+futures = "0.3"
+pin-project-lite = "0.2"
 rstest = "0.25"
 proptest = "1"
 serde_json_path = "0.7"
@@ -31,6 +35,7 @@ gw-pricing = { path = "crates/pricing" }
 gw-ledger = { path = "crates/ledger" }
 gw-meter = { path = "crates/meter" }
 gw-gateway = { path = "crates/gateway" }
+gw-proxy = { path = "crates/proxy" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
