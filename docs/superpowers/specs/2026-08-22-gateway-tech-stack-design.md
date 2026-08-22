@@ -124,6 +124,7 @@ Rust 在本项目的三个具体红利：
 | 指标 | `metrics` + `metrics-exporter-prometheus` | |
 | Tokenizer | `tiktoken-rs`（OpenAI 系）+ `tokenizers`（HF，开放权重模型），词表离线 embed | 严禁运行时下载词表；覆盖边界见 §4.6 |
 | 认证 | `openidconnect`（标准 OIDC）/ `oauth2`（钉钉·飞书·企微·GitHub 等非标）/ `ldap3` / `jsonwebtoken` / `argon2` | 见身份模型 spec §7 |
+| 对象存储 | `opendal` | 一份实现覆盖 S3 / OSS / COS / Azure / GCS / 本地文件系统，契合多形态部署 |
 | WASM hook（后期） | `wasmtime` | |
 | 测试 | `rstest` + `proptest` + `testcontainers` + `loom` | proptest 断言「余额守恒」不变量；loom 验证账本并发 |
 | 前端 | React + Vite + Semi Design | 沿用 New API 的前端技术栈；产物用 `rust-embed` 嵌入二进制 |
@@ -151,7 +152,10 @@ Rust 在本项目的三个具体红利：
 10. **`proto` 规范协议类型定义**。见 §4.4。
 11. **优雅退出与连接排空**。SIGTERM 后停止接受新请求、等待在途流自然结束、归还本节点持有的全部租约。
 12. **双向流的双侧计量**。`Duplex` 端点两个方向都需抽取用量（上行音频秒数、下行 token 与音频秒数），且需在会话存续期间滚动结算，而非终态一次性结算。
-13. **会话级滚动 Hold**。`BillingTiming::Session` 要求 Hold 随会话推进分段追加与捕获，与请求级 Hold 是不同的生命周期模型。
+13. **负载准入探针**。cgroup v2 内存与 CPU 读取（容器内不可用 `sysinfo`，其报告宿主机总量）、并发预算计算、滞回与滑动窗口。
+14. **归档管线**。大小分流、本地暂存与补传、断流状态标记、孤儿文件回收。
+15. **路由过滤与打分框架**。候选过滤、加权打分、选择器；健康统计与熔断器保持节点本地。
+16. **会话级滚动 Hold**。`BillingTiming::Session` 要求 Hold 随会话推进分段追加与捕获，与请求级 Hold 是不同的生命周期模型。
 
 ### 4.4 已评估并否决的方案
 

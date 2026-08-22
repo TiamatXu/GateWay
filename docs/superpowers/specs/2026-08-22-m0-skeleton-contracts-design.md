@@ -167,6 +167,17 @@ pub trait UsageExtractor: Send {
 }
 ```
 
+tee 有两个消费者，职责与可靠性要求不同：
+
+```rust
+pub struct Tee {
+    usage: Box<dyn UsageExtractor>,          // 必须，关系到账单
+    archive: Option<Box<dyn ArchiveSink>>,   // 可选，M6 实现
+}
+```
+
+**归档失败绝不影响 usage 抽取，也绝不影响请求本身。** 账单必须无条件抽出，归档是可开关的旁路。M0 只实现 usage，但 tee 结构按最终形态建。
+
 `snapshot()` 是断连结算的关键——它返回当前已抽取到的用量，不要求流已结束。
 
 `feed` 必须是纯状态机推进，不做 IO、不做阻塞操作，否则会拖慢转发。
@@ -203,7 +214,91 @@ pub struct PriceCtx<'a> {
 
 `estimate_max` 供准入时的最坏情况预扣使用；`at` 同时决定命中哪个价格版本，改价不影响历史账单。
 
-### 3.5 其余 trait
+### 3.5 `AdmissionGate` 与负载保护
+
+准入判断全部收拢到一个闸门——负载过载与优雅退出做的是同一件事：拒绝新请求、不影响在途请求。
+
+```rust
+pub trait AdmissionGate: Send + Sync {
+    fn check(&self, req: &InboundRequest) -> Admission;
+}
+
+pub enum Admission {
+    Allow,
+    Reject { reason: RejectReason, retry_after: Option<Duration> },
+}
+
+pub enum RejectReason {
+    Overloaded(Signal),
+    Draining,
+    RateLimited,
+}
+
+pub enum Signal { Concurrency, Memory, Cpu, SchedulerLag }
+
+pub trait LoadProbe: Send + Sync {
+    fn sample(&self) -> LoadSample;
+}
+
+pub struct LoadSample {
+    pub inflight_streams: u32,
+    pub memory_ratio: f32,
+    pub cpu_ratio: f32,
+}
+```
+
+**主保护是并发预算，不是被动测量。** 在途 SSE 流是内存占用的主要来源，且可预算：
+
+```
+在途流上限 = (容器内存 limit × safety_factor) / per_stream_budget
+默认：per_stream_budget = 64 KiB，safety_factor = 0.7
+```
+
+Rust 无 GC 不确定性，内存约等于「连接数 × 每连接开销 + 转换路径 body 缓冲」，算得准。RSS 水位与 CPU 水位作为兜底，覆盖非流式的内存占用。
+
+**三条实现约束：**
+
+1. **容器内必须读 cgroup，不可用 `sysinfo` 读系统内存**——后者在容器中报告宿主机总量，会恒定显示空闲。读 cgroup v2 的 `memory.current` / `memory.max`（fallback v1），非 Linux 平台降级为禁用负载保护。
+2. **必须有滞回**：进入拒绝态 90%、退出 80%，配滑动窗口平滑瞬时尖峰。单阈值会在临界点反复开关，客户端看到间歇性 503。
+3. **`/readyz` 不反映瞬时负载**，只反映结构性状态（启动完成、DB 连通）。过载时摘节点会把流量压向其余节点引发雪崩；若为整体容量不足，摘谁都无用。过载只在请求路径上返回 503。
+
+拒绝响应为 HTTP 503 + `Retry-After`，**错误体按入站协议的错误格式构造**——OpenAI 协议进来就返回 OpenAI 格式的 error 对象，否则客户端 SDK 无法解析。
+
+### 3.6 `RequestRecord` 与请求头脱敏
+
+```rust
+pub struct RequestRecord {
+    pub request_id: RequestId,
+    pub key_id: ApiKeyId,
+    pub account_chain: SmallVec<[AccountId; 4]>,
+    pub node_path: String,
+    pub channel: ChannelId,
+    pub model: String,
+    pub endpoint: String,
+    pub shape: EndpointShape,
+    pub usage: UsageVector,
+    pub quote: Option<Quote>,
+    pub status: RequestStatus,
+    pub req_headers: HeaderMap,      // 已脱敏
+    pub resp_headers: HeaderMap,     // 已脱敏
+    pub archive_ref: Option<ArchiveRef>,   // M6 填充
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+}
+
+pub enum RequestStatus { Ok, Truncated, Failed, Rejected }
+```
+
+请求头采用黑名单模式记录，**分两层**：
+
+| 层 | 内容 | 可配置 |
+|---|---|---|
+| 硬黑名单 | `Authorization`、`X-Api-Key`、`Api-Key`、`Cookie`、`Set-Cookie`、`Proxy-Authorization`，及各厂商密钥头（`X-Security-Token`、`X-Amz-Security-Token` 等） | **否** |
+| 软黑名单 | `Accept-Encoding`、`Connection` 等噪音头 | 是 |
+
+硬黑名单不可由配置覆盖。理由是安全边界不能依赖管理员配置正确——一次误配即等同密钥泄漏。
+
+### 3.7 其余 trait
 
 ```rust
 pub trait RouteResolver: Send + Sync {
@@ -367,6 +462,7 @@ CREATE TABLE config_version (id INT PRIMARY KEY DEFAULT 1, version BIGINT NOT NU
 ## 5. 请求生命周期
 
 ```
+0. 准入      AdmissionGate::check  [本地原子读，纳秒级]
 1. 入站      axum handler 接收，不读取 body
 2. 鉴权      API Key 哈希 → (key_id, node_id, account_chain)   [单次主键查询]
 3. 路由      (入站协议, 路径, 模型) → Route
@@ -388,6 +484,8 @@ CREATE TABLE config_version (id INT PRIMARY KEY DEFAULT 1, version BIGINT NOT NU
 **第 8、9 步必须是两条独立通道。** capture 关系到钱，要求可靠且及时；日志可以批量、可以延迟、极端情况可以丢弃。若共用一个任务，慢 sink（如 ClickHouse 抖动）会拖累 capture。日志投递对结算路径非阻塞——通道满时丢弃并计数告警，绝不反压到结算。
 
 第 4 步的 `SettlementGuard` 是整条链路的核心——它保证第 8 步在任何终止路径下都会发生。
+
+**检查顺序不可调换**：负载闸门在最前，因为过载时应在最便宜的位置拒绝，而非查库之后。整条链路的成本递增——本地原子读 → 缓存/主键查询 → 本地令牌桶 → PG 写。
 
 ---
 
@@ -432,6 +530,8 @@ impl Drop for SettlementGuard {
 | 账本 | `held == SUM(活跃 Hold)` 不变量 | `proptest` |
 | 泄漏 | `Hold` 未消费即 drop，验证指标上报与回收队列投递 | 单元 |
 | 通道隔离 | `LogSink` 阻塞时 capture 不受影响 | 集成 |
+| 准入 | 内存水位跨越阈值时的滞回行为，不产生抖动 | 单元 |
+| 脱敏 | 硬黑名单头在任何配置下都不出现在 `RequestRecord` 中 | 单元 |
 
 SSE extractor 的跨 chunk 断帧测试必须覆盖——真实网络下 SSE 帧被任意切分，这是最容易出 bug 且最难在生产中发现的地方。
 
@@ -442,7 +542,8 @@ SSE extractor 的跨 chunk 断帧测试必须覆盖——真实网络下 SSE 帧
 1. 真实跑通一次带计费的流式请求，账本余额与用量对得上
 2. **客户端中途断连时，按已生成部分正确结算**
 3. 优雅退出时结算任务全部排空，无漏账
-4. `cargo check` 通过全部 trait 定义，类型签名中无 `todo!()` 残留
+4. 内存水位超阈值时新请求被拒（503 + `Retry-After`，错误体符合入站协议格式），**在途请求不受影响**
+5. `cargo check` 通过全部 trait 定义，类型签名中无 `todo!()` 残留
 
 ---
 
@@ -455,12 +556,15 @@ SSE extractor 的跨 chunk 断帧测试必须覆盖——真实网络下 SSE 帧
 | `Coordinator` | 仅 `pg`，`chain` 长度恒为 1 | M1 |
 | 租约与双模式 | 无，逐请求走 PG | M1 |
 | `PriceEngine` | 单价 × 用量向量，无阶梯与时段 | M5 |
-| 组织树 | Root + 单个 Personal 节点 + 单个 Account | M7 |
+| 组织树 | Root + 单个 Personal 节点 + 单个 Account | M8 |
 | `ProviderRegistry` | 硬编码单厂商，不读 YAML | M2 |
 | 句柄与异步 | 无 | M3 |
-| 转换适配器 | 无，仅透传 | M6 |
-| `LogSink` | 仅 `postgres` 实现 | M8 |
+| 转换适配器 | 无，仅透传 | M7 |
+| `LogSink` | 仅 `postgres` 实现 | M9 |
 | Redis | 无 | M1 |
+| `RoutingPolicy` | 单渠道直连，无过滤与打分 | M3 |
+| `ArchiveSink` | 仅定义接口，不实现 | M6 |
+| `LoadProbe` | 并发预算 + cgroup 内存水位；CPU 与调度延迟留空 | M1 |
 
 ---
 
