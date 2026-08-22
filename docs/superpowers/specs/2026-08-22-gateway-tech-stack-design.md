@@ -103,7 +103,7 @@ Rust 在本项目的三个具体红利：
 | 数据库驱动 | `sqlx`（PostgreSQL） | `query!` 宏在编译期连库校验 SQL 与类型，对账本 SQL 是强正确性保障 |
 | 数据库迁移 | `sqlx::migrate!` | 内建，SQL 文件 embed 进二进制，零额外依赖 |
 | Redis（可选） | `fred` | 异步、连接池、重连；便于用熔断器包裹以实现降级 |
-| 日志分析库 | `clickhouse`（官方 crate） | |
+| ClickHouse 客户端 | `clickhouse`（官方 crate） | 请求日志与用量分析的写入端 |
 | 序列化 | `serde` + `serde_json`；热点路径可换 `sonic-rs` | 透传路径不解析 JSON，只有转换路径承压 |
 | YAML | `serde_norway`（或 `saphyr`） | ⚠️ `serde_yaml` 已停止维护 |
 | Schema 校验 | `jsonschema` | Provider 描述文件必须有 schema 校验，否则用户写错 YAML 只能在运行时暴露 |
@@ -202,17 +202,20 @@ gateway/
 
 ### 6.2 依赖方向
 
-严格单向，禁止环：
+严格单向，禁止出现环。下表读作「左列的 crate 被右列的 crate 依赖」：
 
-```
-core     ← 所有 crate（core 自身零业务依赖）
-infra    ← store, gateway, console
-store    ← ledger, pricing, registry, resource
-proto    ← transform, meter
-registry ← router, meter, pricing
-gateway  ← 顶层编排，依赖除 console 外几乎全部
-bin      ← gateway, console, infra
-```
+| 被依赖方 | 依赖它的 crate |
+|---|---|
+| `core` | 全部 crate |
+| `infra` | `store`, `gateway`, `console`, `bin` |
+| `store` | `ledger`, `pricing`, `registry`, `resource` |
+| `proto` | `transform`, `meter` |
+| `registry` | `router`, `meter`, `pricing` |
+| `ledger`, `pricing`, `meter`, `proxy`, `resource`, `router`, `transform` | `gateway` |
+| `store`, `ledger`, `pricing`, `registry` | `console` |
+| `gateway`, `console` | `bin` |
+
+`gateway` 是数据平面的顶层编排者，`console` 是控制平面的顶层编排者，两者互不依赖；`bin` 只负责组装它们。
 
 ### 6.3 划分理由
 
@@ -239,7 +242,7 @@ bin      ← gateway, console, infra
 
 | 项 | 规定 |
 |---|---|
-| Edition / MSRV | Rust 2024 edition；MSRV 跟随 stable-2 |
+| Edition / MSRV | Rust 2024 edition；MSRV 设为「当前 stable 往前两个版本」，随工具链滚动更新 |
 | 错误处理 | 库 crate 用 `thiserror` 定义具体错误类型；`bin` 顶层用 `anyhow`。网关错误类型**必须能携带上游原始响应体**——错误同样需要按出站协议格式化后返回客户端 |
 | unsafe | 全 workspace `unsafe_code = "forbid"` |
 | lint | `clippy::pedantic` 选择性开启；CI 使用 `-D warnings` |
