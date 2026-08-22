@@ -252,7 +252,7 @@ Redis 调用全部包裹熔断器，故障时降级到 PostgreSQL 路径，**不
 | 1 | **TTL 强制** | 每个 Hold 落库时必须带 `expires_at`，无 TTL 的 Hold 不允许创建 |
 | 2 | **回收器** | 后台任务扫描 `expires_at < now()` 的 Hold，Void 并释放；由 `pg_advisory_lock` 保证单实例执行 |
 | 3 | **租约归还** | 节点优雅退出时主动归还未消费额度；崩溃场景由 TTL 兜底 |
-| 4 | **类型层强制** | `Hold` 建模为必须消费的类型：未经 Capture/Void 即被 drop 时，debug 构建 panic、release 构建告警并上报 |
+| 4 | **类型层强制** | `Hold` 标记 `#[must_use]`；`Drop` 中若未消费则记录指标、告警，并向回收队列发送 best-effort 撤销。**不在 `Drop` 中 panic**——`Drop` 内 panic 在已 panicking 时会 abort，且 async 任务被取消时正走此路径 |
 | 5 | **异步任务** | Hold 挂在任务对象而非请求上；任务终态或超时才释放；孤儿任务巡检覆盖「用户提交后再不查询」的情形 |
 | 6 | **Duplex 会话** | 会话级 Hold 随会话滚动，连接断开必须触发释放；节点崩溃由 TTL 兜底 |
 | 7 | **对账与可观测** | 定期校验不变量 `held == SUM(活跃 Hold)`，不一致即告警；暴露 `active_holds`、`hold_age_p99`、`expired_holds_reclaimed` 指标 |
