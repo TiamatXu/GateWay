@@ -1,0 +1,66 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE async_task\n                SET state = $2,\n                    phase = $3,\n                    polled_at = now(),\n                    settled_at = CASE WHEN $3::SMALLINT <> 0 THEN now() ELSE settled_at END\n              WHERE handle_id = $1 AND phase = 0\n              RETURNING handle_id, submit_endpoint, inbound, model, request_id, phase, state, created_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "handle_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "submit_endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "inbound",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "request_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "phase",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 6,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int2"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "996b2fd119e9ec14b3278113b2bdb32283bd2dd7595eec84593c8d130b318020"
+}

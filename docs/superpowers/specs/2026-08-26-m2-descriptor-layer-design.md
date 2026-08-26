@@ -221,6 +221,11 @@ M2 实现 `static` + `header`/`query`。`oauth2_client_credentials` 与 `sign` �
 两者不冲突，也不重复：前者回答「这个端点要不要回原渠道」，后者回答「响应里哪几个串要重写」。
 调研说的「五维不需要增加维度」在此成立——多字段是描述文件的事，不是形态的事。
 
+> **M3 修正**：「前者回答要不要回原渠道」不够。提交端点的 `shape.handle` 是 `Issues`，
+> 却可能在请求体里引用别的渠道签发的素材。运行期的亲和规则改为「只要解析出任何
+> 句柄，渠道就被钉死」，`shape.handle` 只保留形态维度的职责。
+> 见 `2026-08-26-m3-handle-async-design.md` §4。
+
 加载期校验：`handles.issue` 中至少一项的 `kind` 必须与 `shape.handle` 的 `Issues(k)` 一致，
 否则是声明矛盾。
 

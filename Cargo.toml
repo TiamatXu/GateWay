@@ -58,6 +58,7 @@ gw-bin = { path = "crates/bin" }
 gw-registry = { path = "crates/registry" }
 gw-router = { path = "crates/router" }
 gw-identity = { path = "crates/identity" }
+gw-resource = { path = "crates/resource" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

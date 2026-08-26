@@ -17,6 +17,6 @@ pub use money::Money;
 pub use redact::HeaderRedactor;
 pub use shape::{
     BillingTiming, EndpointShape, HandleKind, HandleRole, ProtocolKind, RequestForm, ResponseForm,
-    RetryPolicy,
+    RetryPolicy, TaskPhase,
 };
 pub use usage::{Accum, Tokenizer, UsageDim, UsageVector, as_billable_i64, dims};

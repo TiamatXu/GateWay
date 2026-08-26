@@ -76,6 +76,17 @@ impl Hold {
         self.expires_at
     }
 
+    /// 把 Hold 的所有权交给一条持久记录（异步任务的句柄）。返回单号，
+    /// 此后析构不再上报泄漏——它不是被泄漏了，是被托管了。
+    ///
+    /// 托管之后仍受 `expires_at` 约束：任务永远不到终态时由 TTL 回收器撤销，
+    /// 这是防死冻结的兜底一道，不能因为「有人管着」就取消。
+    #[must_use]
+    pub fn detach(mut self) -> HoldId {
+        self.consumed = true;
+        self.id
+    }
+
     pub(crate) fn mark_consumed(&mut self) {
         self.consumed = true;
     }

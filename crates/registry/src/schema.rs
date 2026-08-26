@@ -194,6 +194,32 @@ desc! {
     }
 }
 
+/// 句柄字段是入站契约的一部分：同一入站路径上各 provider 必须声明一致的
+/// 消费位置，否则客户端在不同渠道上要写不同的请求。
+impl PartialEq for HandleFieldDef {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.at == other.at
+    }
+}
+
+impl Eq for HandleFieldDef {}
+
+impl AsyncDef {
+    /// 把上游的状态串归一化成三值。不在两张终态表里的一律算运行中——
+    /// 厂商随时可能加中间状态，把未知状态当失败会误结算。
+    #[must_use]
+    pub fn phase_of(&self, state: &str) -> gw_core::TaskPhase {
+        use gw_core::TaskPhase;
+        if self.terminal.succeeded.iter().any(|s| s == state) {
+            return TaskPhase::Succeeded;
+        }
+        if self.terminal.failed.iter().any(|s| s == state) {
+            return TaskPhase::Failed;
+        }
+        TaskPhase::Running
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

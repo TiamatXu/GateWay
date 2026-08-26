@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT h.id, h.kind, h.channel_id, h.provider, h.upstream_id, h.account_chain,\n                    h.key_id, h.endpoint, h.hold_id,\n                    t.submit_endpoint, t.inbound, t.model, t.request_id, t.phase, t.state, t.created_at\n               FROM async_task t JOIN resource_handle h ON h.id = t.handle_id\n              WHERE t.phase = 0 AND COALESCE(t.polled_at, t.created_at) < $1\n              ORDER BY t.created_at\n              LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "channel_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "provider",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "upstream_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "account_chain",
+        "type_info": "Int8Array"
+      },
+      {
+        "ordinal": 6,
+        "name": "key_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "hold_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "submit_endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "inbound",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "request_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "phase",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 14,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "5a0eb1dd80fa6e32bc17e7164efb00f7b8d8dd02d89a566866b5dfd2ef50dca3"
+}

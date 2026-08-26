@@ -14,6 +14,7 @@ gw-proxy = { workspace = true }
 arc-swap = { workspace = true }
 gw-meter = { workspace = true }
 gw-registry = { workspace = true }
+gw-resource = { workspace = true }
 gw-store = { workspace = true }
 serde_json = { workspace = true }
 http = { workspace = true }
@@ -38,6 +39,7 @@ hyper = { workspace = true }
 [dev-dependencies]
 rstest = { workspace = true }
 gw-registry = { workspace = true }
+gw-resource = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 gw-ledger = { workspace = true, features = ["testkit"] }
 gw-store = { workspace = true, features = ["testkit"] }

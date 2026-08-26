@@ -12,6 +12,7 @@ AI 网关。透传优先、Provider 描述文件驱动、Hold/Capture 预付费�
 | `2026-08-22-identity-org-billing-model-design.md` | 组织树、账户链、嵌套额度、冻结机制七道防线、目录同步、第三方登录 |
 | `2026-08-22-milestones-roadmap.md` | M0–M8 里程碑、验收标准、风险登记 |
 | `2026-08-26-m2-descriptor-layer-design.md` | 描述文件结构、算子表、hook 边界、三层校验 |
+| `2026-08-26-m3-handle-async-design.md` | 虚拟句柄形态与归属、渠道亲和、异步任务状态机、终态结算 |
 
 文档同时记录了**被否决方案及其理由**（如为何不用 Pingora、为何不用 StarRocks 作唯一后端、为何冻结记录必须落库）。改动任何已定决策前，先读对应章节。
 

@@ -149,6 +149,9 @@ endpoints:
     handles:
       consume:
         - { at: "path.task_id", kind: task }
+      issue:
+        # 同 aliyun：回显的上游 ID 换回同一个虚拟 ID
+        - { at: "$.id", kind: task }
 
   - id: video_task_cancel
     shape:

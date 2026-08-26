@@ -4,7 +4,7 @@
 //! 所需里程碑，而不是运行期才发现——描述文件作者应当立刻知道自己写的
 //! 端点跑不跑得起来。
 
-use gw_core::{BillingTiming, EndpointShape, HandleRole, RequestForm, ResponseForm};
+use gw_core::{BillingTiming, EndpointShape, RequestForm, ResponseForm};
 
 use crate::schema::{CredentialDef, EndpointDef, InjectDef};
 
@@ -25,7 +25,8 @@ impl std::fmt::Display for Milestone {
     }
 }
 
-/// 解释器当前实现到哪个里程碑。
+/// 解释器**完整**实现到哪个里程碑。里程碑分片实现期间，某个功能到底能不能跑
+/// 以 `gaps` 为准——它按字段回答，这个常量只回答整体进度。
 pub const IMPLEMENTED: Milestone = Milestone::M2;
 
 /// 一处尚未实现的声明。
@@ -58,15 +59,10 @@ fn shape_gaps(shape: EndpointShape, out: &mut Vec<Unsupported>) {
         }
         ResponseForm::Duplex => push("shape.response", "Duplex".to_owned(), Milestone::M4),
     }
-    match shape.handle {
-        HandleRole::None => {}
-        r => push("shape.handle", format!("{r:?}"), Milestone::M3),
-    }
+    // shape.handle 三种角色都已实现（M3 §4.3），无需门禁
     match shape.billing {
-        BillingTiming::InRequest | BillingTiming::NotBilled => {}
-        t @ (BillingTiming::OnTerminal | BillingTiming::Metered) => {
-            push("shape.billing", format!("{t:?}"), Milestone::M3);
-        }
+        BillingTiming::InRequest | BillingTiming::NotBilled | BillingTiming::OnTerminal => {}
+        BillingTiming::Metered => push("shape.billing", "Metered".to_owned(), Milestone::M3),
         BillingTiming::Session => push("shape.billing", "Session".to_owned(), Milestone::M4),
     }
 }
@@ -94,26 +90,5 @@ pub fn gaps(ep: &EndpointDef, auth: Option<&crate::schema::AuthDef>) -> Vec<Unsu
         }
     }
 
-    if !ep.handles.issue.is_empty() || !ep.handles.consume.is_empty() {
-        out.push(Unsupported {
-            field: "handles",
-            value: "句柄字段映射".to_owned(),
-            needs: Milestone::M3,
-        });
-    }
-    if ep.async_task.is_some() {
-        out.push(Unsupported {
-            field: "async",
-            value: "异步任务托管".to_owned(),
-            needs: Milestone::M3,
-        });
-    }
-    if !ep.usage.on_submit.is_empty() {
-        out.push(Unsupported {
-            field: "usage.on_submit",
-            value: "提交后调整".to_owned(),
-            needs: Milestone::M3,
-        });
-    }
     out
 }

@@ -78,6 +78,7 @@ impl LogSink for PgLogSink {
             .map(|r| {
                 json!({
                     "request_id": r.request_id.0,
+                    "handle_id": r.handle_id.map(|h| h.0),
                     "key_id": r.key_id.map(|k| k.0),
                     "account_chain": r.account_chain.iter().map(|a| a.0).collect::<Vec<_>>(),
                     "channel_id": r.channel.0,
@@ -105,7 +106,7 @@ impl LogSink for PgLogSink {
             r"INSERT INTO request_log
                  (request_id, key_id, account_chain, channel_id, model, endpoint,
                   shape, usage, quote, status, req_headers, resp_headers,
-                  started_at, ended_at)
+                  started_at, ended_at, handle_id)
                SELECT (r->>'request_id')::UUID,
                       (r->>'key_id')::BIGINT,
                       ARRAY(SELECT jsonb_array_elements_text(r->'account_chain')::BIGINT),
@@ -119,7 +120,8 @@ impl LogSink for PgLogSink {
                       r->'req_headers',
                       r->'resp_headers',
                       (r->>'started_at')::TIMESTAMPTZ,
-                      (r->>'ended_at')::TIMESTAMPTZ
+                      (r->>'ended_at')::TIMESTAMPTZ,
+                      (r->>'handle_id')::UUID
                  FROM jsonb_array_elements($1::JSONB) AS r
                ON CONFLICT (request_id) DO NOTHING",
         )

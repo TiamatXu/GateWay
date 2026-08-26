@@ -47,7 +47,13 @@ pub fn prepare_upstream_headers(incoming: &HeaderMap, inject: &HeaderMap) -> Hea
     for (name, value) in incoming {
         let n = name.as_str();
         // host 由上游地址决定，照抄会打到错误的虚拟主机
-        if n == "host" || HOP_BY_HOP.contains(&n) || CLIENT_CREDENTIALS.contains(&n) {
+        // content-length 由改写后的实际长度决定：句柄改写会改变体长度，
+        // 照抄客户端的长度会与真正发出的字节数不符
+        if n == "host"
+            || n == "content-length"
+            || HOP_BY_HOP.contains(&n)
+            || CLIENT_CREDENTIALS.contains(&n)
+        {
             continue;
         }
         out.append(name.clone(), value.clone());

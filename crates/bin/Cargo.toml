@@ -15,6 +15,7 @@ gw-core = { workspace = true }
 gw-infra = { workspace = true }
 gw-gateway = { workspace = true }
 gw-registry = { workspace = true }
+gw-resource = { workspace = true }
 gw-ledger = { workspace = true }
 gw-pricing = { workspace = true }
 gw-proxy = { workspace = true }

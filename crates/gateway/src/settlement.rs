@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
-use gw_core::{AccountId, ApiKeyId, ChannelId, Money, RequestId, UsageVector};
+use gw_core::{
+    AccountId, ApiKeyId, ChannelId, HandleId, HoldId, Money, RequestId, TaskPhase, UsageVector,
+};
 use gw_ledger::{Coordinator, Hold};
 use gw_pricing::{PriceCtx, PriceEngine};
 use gw_proxy::SharedTee;
@@ -36,6 +38,8 @@ pub struct RequestRecord {
     pub usage: UsageVector,
     pub amount: Option<Money>,
     pub status: RequestStatus,
+    /// 关联的虚拟句柄。一次异步任务的提交与终态结算是两行日志，靠它串起来。
+    pub handle_id: Option<HandleId>,
     /// 用量为 tokenizer 估算值。explain 接口须明示。
     pub estimated: bool,
     /// 已脱敏
@@ -56,10 +60,21 @@ pub struct SettlementCtx {
     pub tier: String,
     pub endpoint: String,
     pub started_at: DateTime<Utc>,
+    pub handle_id: Option<HandleId>,
     /// 已脱敏
     pub req_headers: HeaderMap,
     /// 已脱敏
     pub resp_headers: HeaderMap,
+}
+
+/// 一次异步任务的终态结算。与同步结算共用计价与日志，区别只在
+/// Hold 已经脱离请求生命周期，只能按单号操作。
+pub struct TaskOutcome {
+    pub hold: HoldId,
+    pub phase: TaskPhase,
+    pub usage: UsageVector,
+    pub estimated: bool,
+    pub ctx: SettlementCtx,
 }
 
 /// 结算执行者。进程级单例，由 app state 持有。
@@ -98,7 +113,79 @@ impl Settler {
         self.dropped_logs.load(Ordering::Relaxed)
     }
 
-    async fn settle(&self, hold: Hold, tee: SharedTee, ctx: SettlementCtx) {
+    /// 异步任务到达终态：按终态响应体的用量结算那笔早已托管的预扣。
+    ///
+    /// 失败的任务一律撤销预扣：厂商对失败的生成任务普遍不收费，而我方也拿不到
+    /// 权威用量——没有依据的扣费比漏收更糟。真需要对失败收费时，
+    /// 应当由描述文件在失败终态上声明用量规则，届时再放开。
+    pub async fn settle_task(&self, o: TaskOutcome) {
+        let TaskOutcome {
+            hold,
+            phase,
+            usage,
+            estimated,
+            ctx,
+        } = o;
+
+        let (status, amount) = if matches!(phase, TaskPhase::Succeeded) {
+            let price_ctx = PriceCtx {
+                model: &ctx.model,
+                channel: ctx.channel,
+                tier: &ctx.tier,
+                endpoint: &ctx.endpoint,
+                // 按提交时刻取价格版本：改价不影响已提交的任务
+                at: ctx.started_at,
+                max_output_tokens: None,
+                input_tokens: None,
+                estimate: None,
+            };
+            match self.pricing.quote(&price_ctx, &usage).await {
+                Ok(q) => match self.coord.capture_by_id(hold, q.amount).await {
+                    Ok(()) => (RequestStatus::Ok, Some(q.amount)),
+                    Err(e) => {
+                        metrics::counter!("gateway.capture_failed").increment(1);
+                        tracing::error!(hold_id = %hold, error = %e, "任务终态捕获失败");
+                        (RequestStatus::Failed, None)
+                    }
+                },
+                Err(e) => {
+                    metrics::counter!("gateway.settle_price_failed").increment(1);
+                    tracing::error!(hold_id = %hold, error = %e, "任务终态计价失败，撤销冻结待补价");
+                    self.void_id(hold).await;
+                    (RequestStatus::Failed, None)
+                }
+            }
+        } else {
+            self.void_id(hold).await;
+            (RequestStatus::Failed, None)
+        };
+
+        self.deliver_log(RequestRecord {
+            request_id: ctx.request_id,
+            key_id: ctx.key_id,
+            account_chain: ctx.account_chain,
+            model: ctx.model,
+            channel: ctx.channel,
+            endpoint: ctx.endpoint,
+            usage,
+            amount,
+            status,
+            handle_id: ctx.handle_id,
+            estimated,
+            req_headers: ctx.req_headers,
+            resp_headers: ctx.resp_headers,
+            started_at: ctx.started_at,
+            ended_at: Utc::now(),
+        });
+    }
+
+    async fn void_id(&self, hold: HoldId) {
+        if let Err(e) = self.coord.void_by_id(hold).await {
+            tracing::error!(hold_id = %hold, error = %e, "撤销冻结失败");
+        }
+    }
+
+    async fn settle(&self, hold: Option<Hold>, tee: SharedTee, ctx: SettlementCtx) {
         // 锁中毒说明有线程 panic 过，但已抽取的用量仍然有效，不能因此漏账
         let (usage, estimated) = match tee.lock() {
             Ok(t) => (t.snapshot(), t.estimated()),
@@ -106,6 +193,29 @@ impl Settler {
                 let t = e.into_inner();
                 (t.snapshot(), t.estimated())
             }
+        };
+
+        // 不计费端点没有 Hold，只留日志：轮询、取消这类端点必须有账可查，
+        // 但没有任何金额动作。
+        let Some(hold) = hold else {
+            self.deliver_log(RequestRecord {
+                request_id: ctx.request_id,
+                key_id: ctx.key_id,
+                account_chain: ctx.account_chain,
+                model: ctx.model,
+                channel: ctx.channel,
+                endpoint: ctx.endpoint,
+                usage,
+                amount: None,
+                status: RequestStatus::Ok,
+                handle_id: ctx.handle_id,
+                estimated,
+                req_headers: ctx.req_headers,
+                resp_headers: ctx.resp_headers,
+                started_at: ctx.started_at,
+                ended_at: Utc::now(),
+            });
+            return;
         };
 
         let price_ctx = PriceCtx {
@@ -117,6 +227,7 @@ impl Settler {
             // 结算用的是实际用量，估算参数无关
             max_output_tokens: None,
             input_tokens: None,
+            estimate: None,
         };
 
         let (status, amount) = match self.pricing.quote(&price_ctx, &usage).await {
@@ -152,12 +263,19 @@ impl Settler {
             usage,
             amount,
             status,
+            handle_id: ctx.handle_id,
             estimated,
             req_headers: ctx.req_headers,
             resp_headers: ctx.resp_headers,
             started_at: ctx.started_at,
             ended_at: Utc::now(),
         });
+    }
+
+    /// 直接投递一条记录。异步任务的提交那一行没有金额动作，走不到结算，
+    /// 但必须有账可查。
+    pub fn log(&self, rec: RequestRecord) {
+        self.deliver_log(rec);
     }
 
     /// 非阻塞投递：通道满时丢弃并计数，绝不反压到结算路径。
@@ -173,7 +291,10 @@ impl Settler {
 
 /// 持有 Hold 直到响应流终止。析构即触发结算。
 pub struct SettlementGuard {
+    /// `None` 表示不计费端点：仍要留日志，只是没有金额动作。
     hold: Option<Hold>,
+    /// 结算是否已触发。Drop 可能被走到多次的路径调用，只认第一次。
+    fired: bool,
     tee: SharedTee,
     ctx: SettlementCtx,
     settler: Arc<Settler>,
@@ -181,9 +302,15 @@ pub struct SettlementGuard {
 
 impl SettlementGuard {
     #[must_use]
-    pub fn new(hold: Hold, tee: SharedTee, ctx: SettlementCtx, settler: Arc<Settler>) -> Self {
+    pub fn new(
+        hold: Option<Hold>,
+        tee: SharedTee,
+        ctx: SettlementCtx,
+        settler: Arc<Settler>,
+    ) -> Self {
         Self {
-            hold: Some(hold),
+            hold,
+            fired: false,
             tee,
             ctx,
             settler,
@@ -193,7 +320,11 @@ impl SettlementGuard {
 
 impl Drop for SettlementGuard {
     fn drop(&mut self) {
-        let Some(hold) = self.hold.take() else { return };
+        if self.fired {
+            return;
+        }
+        self.fired = true;
+        let hold = self.hold.take();
 
         // Drop 中不能 await，只能 spawn。无运行时时让 Hold 自身的 Drop 上报泄漏，
         // 交由 TTL 回收器兜底。
@@ -257,10 +388,12 @@ mod tests {
         async fn capture_partial(&self, _hold: &Hold, _amt: Money) -> Result<(), LedgerError> {
             Ok(())
         }
-        async fn capture_by_id(&self, _id: gw_core::HoldId, _a: Money) -> Result<(), LedgerError> {
+        async fn capture_by_id(&self, _id: gw_core::HoldId, a: Money) -> Result<(), LedgerError> {
+            self.captured.lock().unwrap().push(a);
             Ok(())
         }
         async fn void_by_id(&self, _id: gw_core::HoldId) -> Result<(), LedgerError> {
+            self.voided.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn reclaim_expired(&self, _limit: i64) -> Result<u64, LedgerError> {
@@ -387,6 +520,7 @@ mod tests {
             tier: "default".into(),
             endpoint: "/v1/chat/completions".into(),
             started_at: Utc::now(),
+            handle_id: None,
         }
     }
 
@@ -400,7 +534,7 @@ mod tests {
             estimated,
         }))));
         SettlementGuard::new(
-            Hold::stub(Money::from_nanos(1_000), h.reclaim_tx.clone()),
+            Some(Hold::stub(Money::from_nanos(1_000), h.reclaim_tx.clone())),
             tee,
             ctx(),
             Arc::clone(&h.settler),
@@ -495,6 +629,77 @@ mod tests {
         let rec = h.logs.try_recv().unwrap();
         assert!(rec.estimated);
         assert_eq!(rec.amount, Some(Money::from_nanos(60)));
+    }
+
+    fn task_outcome(phase: gw_core::TaskPhase, tokens: i64) -> TaskOutcome {
+        let mut usage = UsageVector::new();
+        usage.set("output_tokens", tokens);
+        TaskOutcome {
+            hold: gw_core::HoldId(uuid::Uuid::new_v4()),
+            phase,
+            usage,
+            estimated: false,
+            ctx: SettlementCtx {
+                handle_id: Some(gw_core::HandleId(uuid::Uuid::new_v4())),
+                ..ctx()
+            },
+        }
+    }
+
+    /// 任务成功：按终态用量捕获那笔早已托管的预扣
+    #[tokio::test]
+    async fn terminal_success_captures_the_detached_hold() {
+        let mut h = harness(false, 16);
+
+        h.settler
+            .settle_task(task_outcome(gw_core::TaskPhase::Succeeded, 30))
+            .await;
+
+        assert_eq!(
+            *h.coord.captured.lock().unwrap(),
+            vec![Money::from_nanos(60)]
+        );
+        let rec = h.logs.try_recv().unwrap();
+        assert_eq!(rec.status, RequestStatus::Ok);
+        assert!(rec.handle_id.is_some(), "结算记录要能追回是哪个任务");
+    }
+
+    /// 任务失败一律不收费：没有权威用量时扣费没有依据
+    #[tokio::test]
+    async fn terminal_failure_voids_without_charging() {
+        let mut h = harness(false, 16);
+
+        h.settler
+            .settle_task(task_outcome(gw_core::TaskPhase::Failed, 30))
+            .await;
+
+        assert!(h.coord.captured.lock().unwrap().is_empty());
+        assert_eq!(h.coord.voided.load(Ordering::Relaxed), 1);
+        assert_eq!(h.logs.try_recv().unwrap().status, RequestStatus::Failed);
+    }
+
+    /// 不计费端点没有 Hold，但必须留下日志
+    #[tokio::test]
+    async fn unbilled_endpoint_logs_without_touching_money() {
+        let mut h = harness(false, 16);
+
+        let tee = Arc::new(Mutex::new(Tee::new(Box::new(FixedUsage {
+            tokens: 0,
+            estimated: false,
+        }))));
+        drop(SettlementGuard::new(
+            None,
+            tee,
+            ctx(),
+            Arc::clone(&h.settler),
+        ));
+        h.settler.tasks().close();
+        h.settler.tasks().wait().await;
+
+        assert!(h.coord.captured.lock().unwrap().is_empty());
+        assert_eq!(h.coord.voided.load(Ordering::Relaxed), 0);
+        let rec = h.logs.try_recv().expect("不计费也要有账可查");
+        assert_eq!(rec.amount, None);
     }
 
     /// 日志投递对结算路径非阻塞：通道满时丢弃并计数，绝不反压到结算

@@ -62,3 +62,7 @@ endpoints:
     handles:
       consume:
         - { at: "path.task_id", kind: task }
+      issue:
+        # 轮询响应回显上游 task_id。签发是幂等的：这里会换回同一个虚拟 ID，
+        # 客户端从头到尾只见得到自己手上那一个。
+        - { at: "$.output.task_id", kind: task }

@@ -19,6 +19,7 @@ fn record(id: RequestId) -> RequestRecord {
     req_headers.insert("content-type", HeaderValue::from_static("application/json"));
 
     RequestRecord {
+        handle_id: None,
         request_id: id,
         key_id: Some(ApiKeyId(1)),
         account_chain: smallvec::smallvec![AccountId(7)],

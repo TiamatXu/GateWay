@@ -9,12 +9,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gw_core::{HandleRole, ProtocolKind, ProviderId};
+use gw_core::{HandleRole, ProtocolKind, ProviderId, ResponseForm};
 use smol_str::SmolStr;
 
 use crate::catalog::{Catalog, EndpointDesc, Handles, InboundRoute, Usage};
 use crate::error::RegistryError;
 use crate::hook::HookRegistry;
+use crate::locator::Locator;
 use crate::milestone::{self, Unsupported};
 use crate::rule::{Source, UsageRule};
 use crate::schema::{
@@ -171,7 +172,7 @@ impl Cx<'_> {
             }
         }
 
-        validate_handles(&ep, &err)?;
+        validate_handles(&ep, &inbound_params, &err)?;
 
         let protocol = ep
             .protocol
@@ -265,6 +266,7 @@ impl Cx<'_> {
             desc.protocol.clone(),
             desc.model.clone(),
             desc.stream_flag.clone(),
+            desc.handles.consume.clone(),
         );
         if let Some(&ri) = self.route_index.get(&key) {
             if let Some(field) = self.catalog.routes[ri].contract_diff(&candidate) {
@@ -304,9 +306,11 @@ impl Cx<'_> {
 }
 
 /// `handles.issue` 至少要有一项与 `shape.handle` 的 `Issues(k)` 同类型，
-/// 否则粗粒度维度与细粒度字段映射互相矛盾。
+/// 否则粗粒度维度与细粒度字段映射互相矛盾。同时校验取值位置在运行期够得着：
+/// 签发只能改写 JSON 响应体，消费的路径参数必须真的存在于入站路径。
 fn validate_handles(
     ep: &EndpointDef,
+    inbound_params: &HashSet<&SmolStr>,
     err: &impl Fn(String) -> RegistryError,
 ) -> Result<(), RegistryError> {
     if let HandleRole::Issues(kind) = ep.shape.handle
@@ -316,6 +320,32 @@ fn validate_handles(
         return Err(err(format!(
             "shape.handle 声明签发 {kind:?}，但 handles.issue 里没有该类型的字段"
         )));
+    }
+
+    for h in &ep.handles.issue {
+        if !h.at.is_body() {
+            return Err(err(format!(
+                "handles.issue 的位置 {} 不在响应体内——签发只能改写 JSON 响应体",
+                h.at
+            )));
+        }
+        if ep.shape.response != ResponseForm::Json {
+            return Err(err(format!(
+                "handles.issue 需要 response: json，当前是 {:?}——流式与二进制响应无法原地改写",
+                ep.shape.response
+            )));
+        }
+    }
+
+    for h in &ep.handles.consume {
+        if let Locator::PathParam(name) = &h.at
+            && !inbound_params.contains(name)
+        {
+            return Err(err(format!(
+                "handles.consume 引用了路径参数 {name}，但入站路径 {} 没有声明它",
+                ep.route.inbound
+            )));
+        }
     }
     Ok(())
 }

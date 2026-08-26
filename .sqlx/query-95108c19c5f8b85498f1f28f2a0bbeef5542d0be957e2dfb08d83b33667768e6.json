@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, kind, channel_id, provider, upstream_id, account_chain,\n                    key_id, endpoint, hold_id\n               FROM resource_handle WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "channel_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "provider",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "upstream_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "account_chain",
+        "type_info": "Int8Array"
+      },
+      {
+        "ordinal": 6,
+        "name": "key_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "hold_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "95108c19c5f8b85498f1f28f2a0bbeef5542d0be957e2dfb08d83b33667768e6"
+}

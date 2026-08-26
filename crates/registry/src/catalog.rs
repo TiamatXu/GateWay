@@ -88,6 +88,9 @@ pub struct InboundRoute {
     pub model: Option<Locator>,
     /// 客户端要求流式的标志位在哪
     pub stream_flag: Option<Locator>,
+    /// 请求里哪些字段携带虚拟句柄。渠道亲和要在选渠道**之前**解析句柄，
+    /// 而那时还没有 provider 绑定，故此声明必须在入站契约上。
+    pub consume: Vec<HandleFieldDef>,
     /// provider → 该 provider 在此路由上的端点下标
     bindings: HashMap<ProviderId, usize>,
 }
@@ -108,6 +111,7 @@ impl InboundRoute {
         protocol: ProtocolKind,
         model: Option<Locator>,
         stream_flag: Option<Locator>,
+        consume: Vec<HandleFieldDef>,
     ) -> Self {
         Self {
             method,
@@ -116,6 +120,7 @@ impl InboundRoute {
             protocol,
             model,
             stream_flag,
+            consume,
             bindings: HashMap::new(),
         }
     }
@@ -135,6 +140,9 @@ impl InboundRoute {
         }
         if self.stream_flag != other.stream_flag {
             return Some("stream_flag");
+        }
+        if self.consume != other.consume {
+            return Some("handles.consume");
         }
         None
     }

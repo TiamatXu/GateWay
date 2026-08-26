@@ -207,8 +207,8 @@ fn unimplemented_endpoints_are_deferred_not_routed() {
         .iter()
         .map(|d| format!("{}/{}", d.provider.as_str(), d.endpoint))
         .collect();
+    // 二进制上传与 AK/SK 签名仍未实现
     assert!(deferred.contains(&"volcengine/asset_upload".to_owned()));
-    assert!(deferred.contains(&"aliyun/task_query".to_owned()));
 
     // 已声明、可查，但入站解析不到
     assert!(
@@ -222,6 +222,36 @@ fn unimplemented_endpoints_are_deferred_not_routed() {
             .catalog
             .resolve(Method::Post, "/volcengine/assets/upload")
             .is_none(),
-        "M3 才实现的端点不应当接客"
+        "尚未实现的端点不应当接客"
     );
+}
+
+/// M3 §4.3/§4.4：句柄映射与异步托管落地后，阿里云百炼的提交与轮询端点开始接客
+#[test]
+fn async_task_endpoints_are_live() {
+    let loaded = load();
+    let deferred: Vec<_> = loaded
+        .deferred
+        .iter()
+        .map(|d| format!("{}/{}", d.provider.as_str(), d.endpoint))
+        .collect();
+    assert!(!deferred.contains(&"aliyun/task_query".to_owned()));
+    assert!(!deferred.contains(&"aliyun/text2video_submit".to_owned()));
+
+    assert!(
+        loaded
+            .catalog
+            .resolve(
+                Method::Post,
+                "/aliyun/api/v1/services/aigc/text2video/video-synthesis"
+            )
+            .is_some()
+    );
+    let poll = loaded
+        .catalog
+        .resolve(Method::Get, "/aliyun/api/v1/tasks/abc")
+        .expect("轮询端点应当接客");
+    assert_eq!(poll.params.get("task_id").map(String::as_str), Some("abc"));
+    // 消费位置属于入站契约：不解析出它就无从做渠道亲和
+    assert_eq!(poll.route.consume.len(), 1);
 }

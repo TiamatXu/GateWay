@@ -31,6 +31,12 @@ pub struct PriceCtx<'a> {
     pub max_output_tokens: Option<u32>,
     /// 已知的真实输入用量。为 `None` 时按配置上限估算——宁可高估也不能不预扣。
     pub input_tokens: Option<i64>,
+    /// 描述文件的 `usage.estimate` 在请求体上求出的用量。
+    ///
+    /// token 维度不走它：输出量在请求时不可知，预扣必须按最坏情况的上限。
+    /// 但视频时长、图片像素这类维度的上限**就写在请求里**，没有它，
+    /// `OnTerminal` 的任务类端点预扣恒为 0，等于没有预扣。
+    pub estimate: Option<&'a UsageVector>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +163,11 @@ impl PriceEngine for PgPriceEngine {
             let quantity = match rule.dim.as_str() {
                 dims::INPUT_TOKENS => input_ceiling,
                 dims::OUTPUT_TOKENS | dims::REASONING_TOKENS => output_ceiling,
-                _ => continue,
+                other => match ctx.estimate.map_or(0, |u| u.get(other)) {
+                    n if n > 0 => n,
+                    // 估不出上限的维度不参与预扣，结算时才知道
+                    _ => continue,
+                },
             };
             total = total
                 .checked_add(line_amount(rule.unit_price, quantity)?)

@@ -47,6 +47,51 @@ impl PathExpr {
     pub fn one<'a>(&self, doc: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
         self.path.query(doc).exactly_one().ok()
     }
+
+    /// 取唯一命中节点的归一化位置，供原地改写。多值命中同样返回 `None`。
+    #[must_use]
+    pub fn one_location(&self, doc: &serde_json::Value) -> Option<Vec<Step>> {
+        let located = self.path.query_located(doc);
+        let mut it = located.locations();
+        let first = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some(
+            first
+                .iter()
+                .map(|e| {
+                    e.as_name().map_or_else(
+                        || Step::Index(e.as_index().unwrap_or_default()),
+                        |n| Step::Name(n.to_owned()),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+/// 归一化路径的一步。`JSONPath` 查询借着文档，改写要先把位置取成拥有所有权的形式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    Name(String),
+    Index(usize),
+}
+
+/// 按归一化位置取可变引用。位置来自 `one_location`，中途取不到即返回 `None`。
+#[must_use]
+pub fn get_mut<'a>(
+    doc: &'a mut serde_json::Value,
+    steps: &[Step],
+) -> Option<&'a mut serde_json::Value> {
+    let mut cur = doc;
+    for step in steps {
+        cur = match step {
+            Step::Name(n) => cur.as_object_mut()?.get_mut(n.as_str())?,
+            Step::Index(i) => cur.as_array_mut()?.get_mut(*i)?,
+        };
+    }
+    Some(cur)
 }
 
 impl PartialEq for PathExpr {
@@ -205,6 +250,28 @@ mod tests {
     #[case("$.[")]
     fn rejects_malformed(#[case] src: &str) {
         assert!(src.parse::<Locator>().is_err());
+    }
+
+    #[test]
+    fn one_location_addresses_the_node_for_rewriting() {
+        let mut doc = serde_json::json!({"content": [{"image_url": {"url": "asset://x"}}]});
+        let steps = PathExpr::parse("$.content[0].image_url.url")
+            .unwrap()
+            .one_location(&doc)
+            .unwrap();
+        *get_mut(&mut doc, &steps).unwrap() = serde_json::json!("asset://y");
+        assert_eq!(doc["content"][0]["image_url"]["url"], "asset://y");
+    }
+
+    #[test]
+    fn one_location_rejects_multi_hit() {
+        let doc = serde_json::json!({"a": [{"n": 1}, {"n": 2}]});
+        assert!(
+            PathExpr::parse("$.a[*].n")
+                .unwrap()
+                .one_location(&doc)
+                .is_none()
+        );
     }
 
     #[test]

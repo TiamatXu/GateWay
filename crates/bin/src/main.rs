@@ -20,6 +20,7 @@ use gw_ledger::{Coordinator, PgCoordinator};
 use gw_pricing::{EstimateCeilings, PgPriceEngine};
 use gw_proxy::Upstream;
 use gw_registry::HookRegistry;
+use gw_resource::PgResourceStore;
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -63,6 +64,23 @@ async fn main() -> anyhow::Result<()> {
     );
     let reclaimer = spawn_reclaimer(coord.clone(), reclaim_rx);
 
+    let resources = Arc::new(PgResourceStore::new(pool.clone()));
+
+    // 孤儿巡检：用户提交后再不查询的异步任务由它推进到终态
+    let (sweep_stop, sweep_rx) = tokio::sync::watch::channel(false);
+    let sweeper = gw_gateway::spawn_sweeper(
+        gw_gateway::TaskSweeper::new(
+            pool.clone(),
+            resources.clone(),
+            Arc::clone(&endpoints),
+            Upstream::new(),
+            Arc::clone(&settler),
+            gw_gateway::SweepConfig::default(),
+        ),
+        Duration::from_secs(60),
+        sweep_rx,
+    );
+
     let state = Arc::new(AppState {
         pool,
         redactor: gw_core::HeaderRedactor::default(),
@@ -72,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         settler: Arc::clone(&settler),
         upstream: Upstream::new(),
         endpoints,
+        resources,
         config: GatewayConfig::default(),
     });
 
@@ -90,6 +109,10 @@ async fn main() -> anyhow::Result<()> {
         })
         .await
         .context("服务异常退出")?;
+
+    // 巡检可能正在结算某个任务，先让它收尾再排空结算队列
+    let _ = sweep_stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), sweeper).await;
 
     // 在途流已结束，此时才排空结算——否则关机瞬间断连的请求会漏账
     settler.tasks().close();

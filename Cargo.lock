@@ -741,6 +741,7 @@ dependencies = [
  "gw-pricing",
  "gw-proxy",
  "gw-registry",
+ "gw-resource",
  "gw-store",
  "metrics",
  "tokio",
@@ -776,6 +777,7 @@ dependencies = [
  "gw-pricing",
  "gw-proxy",
  "gw-registry",
+ "gw-resource",
  "gw-store",
  "http",
  "http-body-util",
@@ -903,6 +905,23 @@ dependencies = [
  "smol_str",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "gw-resource"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "gw-core",
+ "gw-store",
+ "rstest",
+ "smallvec",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

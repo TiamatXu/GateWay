@@ -1,6 +1,7 @@
 //! M0 验收：一条真实链路，从准入到落账。
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -67,12 +68,54 @@ async fn echo_handler(uri: axum::http::Uri, headers: axum::http::HeaderMap) -> R
     axum::Json(serde_json::json!({ "path": uri.path(), "headers": h })).into_response()
 }
 
+/// 阿里云百炼异步任务的模拟上游：提交返回 PENDING，第一次轮询 RUNNING，
+/// 第二次起 SUCCEEDED 并带上权威用量。
+static POLLS: AtomicUsize = AtomicUsize::new(0);
+const UPSTREAM_TASK_ID: &str = "up-task-0001";
+
+async fn task_submit_handler() -> Response {
+    POLLS.store(0, Ordering::SeqCst);
+    axum::Json(serde_json::json!({
+        "request_id": "r-1",
+        "output": { "task_id": UPSTREAM_TASK_ID, "task_status": "PENDING" }
+    }))
+    .into_response()
+}
+
+async fn task_query_handler(axum::extract::Path(task_id): axum::extract::Path<String>) -> Response {
+    // 上游只认得上游 ID：网关没把虚拟 ID 换回去的话，这里就该炸
+    assert_eq!(task_id, UPSTREAM_TASK_ID, "上游收到的不是上游 ID");
+    if POLLS.fetch_add(1, Ordering::SeqCst) == 0 {
+        return axum::Json(serde_json::json!({
+            "output": { "task_id": UPSTREAM_TASK_ID, "task_status": "RUNNING" }
+        }))
+        .into_response();
+    }
+    axum::Json(serde_json::json!({
+        "output": {
+            "task_id": UPSTREAM_TASK_ID,
+            "task_status": "SUCCEEDED",
+            "video_url": "http://example.invalid/v.mp4"
+        },
+        "usage": { "duration": 5, "video_count": 1 }
+    }))
+    .into_response()
+}
+
 async fn spawn_upstream() -> SocketAddr {
     let app = Router::new()
         .route("/v1/chat/completions", post(sse_handler))
         .route("/v1/embeddings", post(json_handler))
         // Anthropic 原生端点：入站是 /anthropic/v1/messages，上游是 /v1/messages
-        .route("/v1/messages", post(echo_handler));
+        .route("/v1/messages", post(echo_handler))
+        .route(
+            "/api/v1/services/aigc/text2video/video-synthesis",
+            post(task_submit_handler),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}",
+            axum::routing::get(task_query_handler),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -98,6 +141,7 @@ struct Fixture {
     pool: PgPool,
     load: Arc<LoadGuard>,
     settler: Arc<Settler>,
+    endpoints: Arc<gw_gateway::Endpoints>,
     account: i64,
     api_key: String,
     model: String,
@@ -205,6 +249,13 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
         },
     ));
     let settler = Arc::new(Settler::new(coord.clone(), pricing.clone(), log_tx));
+    let endpoints = Arc::new(
+        gw_gateway::Endpoints::open(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../providers"),
+            gw_registry::HookRegistry::new(),
+        )
+        .expect("内置描述文件应当可加载"),
+    );
 
     let state = Arc::new(AppState {
         pool: pool.clone(),
@@ -214,13 +265,8 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
         pricing,
         settler: Arc::clone(&settler),
         upstream: Upstream::new(),
-        endpoints: Arc::new(
-            gw_gateway::Endpoints::open(
-                concat!(env!("CARGO_MANIFEST_DIR"), "/../../providers"),
-                gw_registry::HookRegistry::new(),
-            )
-            .expect("内置描述文件应当可加载"),
-        ),
+        resources: Arc::new(gw_resource::PgResourceStore::new(pool.clone())),
+        endpoints: Arc::clone(&endpoints),
         config: GatewayConfig::default(),
     });
 
@@ -239,6 +285,7 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
         pool,
         load,
         settler,
+        endpoints,
         account,
         api_key,
         model,
@@ -311,6 +358,34 @@ impl Fixture {
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "hi"}],
             }))
+    }
+
+    /// 为某个模型的某个维度加一条价格规则。异步任务按时长计费，
+    /// 用独立的模型名避免与 fixture 里的 token 价格叠加。
+    async fn add_price(&self, model: &str, dim: &str, unit_price: i64) {
+        sqlx::query(
+            "INSERT INTO price_rule
+               (version, match_model, dim, unit_price, cost_price, effective_from)
+             VALUES (1, $1, $2, $3, 0, now() - interval '1 day')",
+        )
+        .bind(model)
+        .bind(dim)
+        .bind(unit_price)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// 走网关轮询一次任务
+    async fn poll(&self, virtual_id: &str) -> serde_json::Value {
+        let resp = reqwest::Client::new()
+            .get(format!("{}/aliyun/api/v1/tasks/{virtual_id}", self.base))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        resp.json().await.unwrap()
     }
 
     async fn balances(&self) -> (i64, i64) {
@@ -752,4 +827,180 @@ async fn descriptors_alone_decide_auth_and_path_rewriting() {
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
     panic!("冻结未释放：{:?}", fx.balances().await);
+}
+
+// ------------------------------------------ M3 §4.3/§4.4：句柄映射与异步任务托管
+
+/// 阿里云百炼原生异步端点：提交拿虚拟 ID、轮询到终态才落账。
+/// 这是 M3 的验收标准之一，也是 `OnTerminal` 计费时点的首次实战。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_task_settles_only_on_terminal_state() {
+    let fx = setup(START_BALANCE, 64).await;
+    fx.add_channel("aliyun", b"aliyun-secret").await;
+    let task_model = format!("video-{}", uuid::Uuid::new_v4().simple());
+    fx.add_price(&task_model, "audio_millis", UNIT_PRICE).await;
+
+    // 提交：duration 10 秒 → 预扣按 10000 毫秒估
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/aliyun/api/v1/services/aigc/text2video/video-synthesis",
+            fx.base
+        ))
+        .bearer_auth(&fx.api_key)
+        .json(&serde_json::json!({
+            "model": task_model,
+            "parameters": { "duration": 10 },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let submitted: serde_json::Value = resp.json().await.unwrap();
+    let virtual_id = submitted["output"]["task_id"].as_str().unwrap().to_owned();
+
+    assert!(
+        virtual_id.starts_with("gwh_"),
+        "客户端拿到的应当是虚拟句柄，实际是 {virtual_id}"
+    );
+    assert_ne!(virtual_id, UPSTREAM_TASK_ID, "上游 ID 泄漏给了客户端");
+
+    // 提交后钱还没扣，只是冻着
+    let (balance, held) = fx.balances().await;
+    assert_eq!(balance, START_BALANCE, "提交时不该落账");
+    assert_eq!(held, 10_000, "预扣应按请求里的时长上限估算");
+
+    // 第一次轮询：仍在运行，不结算
+    let running: serde_json::Value = fx.poll(&virtual_id).await;
+    assert_eq!(running["output"]["task_status"], "RUNNING");
+    assert_eq!(
+        running["output"]["task_id"].as_str().unwrap(),
+        virtual_id,
+        "轮询响应回显的 ID 应当换回同一个虚拟句柄"
+    );
+    let (balance, held) = fx.balances().await;
+    assert_eq!((balance, held), (START_BALANCE, 10_000), "未终态不得结算");
+
+    // 第二次轮询：成功终态，按权威用量（5 秒）结算
+    let done: serde_json::Value = fx.poll(&virtual_id).await;
+    assert_eq!(done["output"]["task_status"], "SUCCEEDED");
+
+    let (balance, held) = fx.settled().await;
+    assert_eq!(held, 0, "终态后预扣应释放");
+    assert_eq!(
+        balance,
+        START_BALANCE - 5_000,
+        "应按终态响应的 5 秒结算，而非预扣的 10 秒"
+    );
+
+    // 再查一次不得重复扣费
+    let _: serde_json::Value = fx.poll(&virtual_id).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(fx.balances().await, (START_BALANCE - 5_000, 0));
+}
+
+/// 句柄带着归属：别人的任务查不到，且答 404 而非 403——
+/// 用 403 区分开等于告诉对方这个 ID 是存在的
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_tenant_cannot_poll_someone_elses_task() {
+    let fx = setup(START_BALANCE, 64).await;
+    fx.add_channel("aliyun", b"aliyun-secret").await;
+    let task_model = format!("video-{}", uuid::Uuid::new_v4().simple());
+    fx.add_price(&task_model, "audio_millis", UNIT_PRICE).await;
+    let intruder = fx.add_api_key(START_BALANCE).await;
+
+    let submitted: serde_json::Value = reqwest::Client::new()
+        .post(format!(
+            "{}/aliyun/api/v1/services/aigc/text2video/video-synthesis",
+            fx.base
+        ))
+        .bearer_auth(&fx.api_key)
+        .json(&serde_json::json!({ "model": task_model, "parameters": { "duration": 1 } }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let virtual_id = submitted["output"]["task_id"].as_str().unwrap().to_owned();
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/aliyun/api/v1/tasks/{virtual_id}", fx.base))
+        .bearer_auth(&intruder)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// 上游 ID 不能被直接拿来查：只认网关签发的虚拟句柄
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_upstream_ids_are_not_accepted() {
+    let fx = setup(START_BALANCE, 64).await;
+    fx.add_channel("aliyun", b"aliyun-secret").await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/aliyun/api/v1/tasks/{UPSTREAM_TASK_ID}",
+            fx.base
+        ))
+        .bearer_auth(&fx.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // 格式对但不存在的句柄同样查不到
+    let bogus = format!("gwh_{}", uuid::Uuid::new_v4().simple());
+    let resp = reqwest::Client::new()
+        .get(format!("{}/aliyun/api/v1/tasks/{bogus}", fx.base))
+        .bearer_auth(&fx.api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// 孤儿巡检：用户提交完再不查询，预扣不能一直挂到 TTL 到期
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sweeper_settles_tasks_nobody_polls() {
+    let fx = setup(START_BALANCE, 64).await;
+    fx.add_channel("aliyun", b"aliyun-secret").await;
+    let task_model = format!("video-{}", uuid::Uuid::new_v4().simple());
+    fx.add_price(&task_model, "audio_millis", UNIT_PRICE).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/aliyun/api/v1/services/aigc/text2video/video-synthesis",
+            fx.base
+        ))
+        .bearer_auth(&fx.api_key)
+        .json(&serde_json::json!({ "model": task_model, "parameters": { "duration": 10 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(fx.balances().await, (START_BALANCE, 10_000));
+
+    let sweeper = gw_gateway::TaskSweeper::new(
+        fx.pool.clone(),
+        Arc::new(gw_resource::PgResourceStore::new(fx.pool.clone())),
+        Arc::clone(&fx.endpoints),
+        gw_proxy::Upstream::new(),
+        Arc::clone(&fx.settler),
+        gw_gateway::SweepConfig {
+            // 巡检的判定标准是「多久没人问」，测试里放到零
+            idle_for: Duration::ZERO,
+            ..gw_gateway::SweepConfig::default()
+        },
+    );
+
+    // 第一轮：上游说还在跑，不结算
+    assert!(sweeper.sweep_once().await >= 1);
+    assert_eq!(fx.balances().await, (START_BALANCE, 10_000));
+
+    // 第二轮：上游给出终态，按权威用量结算
+    assert!(sweeper.sweep_once().await >= 1);
+    let (balance, held) = fx.settled().await;
+    assert_eq!(held, 0);
+    assert_eq!(balance, START_BALANCE - 5_000);
 }

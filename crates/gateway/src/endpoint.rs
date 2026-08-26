@@ -16,6 +16,8 @@ use smol_str::SmolStr;
 pub struct EndpointSpecs {
     /// 读请求体，用于预扣估算
     pub estimate: Arc<UsageSpec>,
+    /// 读提交响应体，用于调整预扣
+    pub on_submit: Arc<UsageSpec>,
     /// 读响应体（含流式聚合与文本兜底），用于结算
     pub response: Arc<UsageSpec>,
 }
@@ -37,6 +39,7 @@ impl SpecTable {
                 response.extend(e.usage.fallback.iter().cloned());
                 let specs = EndpointSpecs {
                     estimate: Arc::new(UsageSpec::from_rules(&e.usage.estimate)),
+                    on_submit: Arc::new(UsageSpec::from_rules(&e.usage.on_submit)),
                     response: Arc::new(UsageSpec::from_rules(&response)),
                 };
                 ((e.provider.clone(), e.id.clone()), Arc::new(specs))

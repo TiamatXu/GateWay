@@ -98,6 +98,53 @@ pub enum HandleKind {
     Session,
 }
 
+impl HandleKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::File => "file",
+            Self::Batch => "batch",
+            Self::Asset => "asset",
+            Self::Cache => "cache",
+            Self::Response => "response",
+            Self::Session => "session",
+        }
+    }
+
+    /// 从落库的名字还原。未知名字返回 `None`——描述文件降级后旧句柄仍可能在表里。
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "task" => Self::Task,
+            "file" => Self::File,
+            "batch" => Self::Batch,
+            "asset" => Self::Asset,
+            "cache" => Self::Cache,
+            "response" => Self::Response,
+            "session" => Self::Session,
+            _ => return None,
+        })
+    }
+}
+
+/// 异步任务的阶段。上游的状态串五花八门，归一化成三值由描述文件的
+/// `async.terminal` 决定；`core` 只认这三种，不认任何厂商状态名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl TaskPhase {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

@@ -52,6 +52,7 @@ fn ctx(model: &str, at: DateTime<Utc>) -> PriceCtx<'_> {
         at,
         max_output_tokens: None,
         input_tokens: None,
+        estimate: None,
     }
 }
 
