@@ -33,6 +33,7 @@ cargo sqlx prepare --workspace -- --all-targets   # 改过 SQL 后重新生成 .
 - crate 依赖方向严格单向，见技术基线 §6.2；`core` 保持极瘦
 - 最简实现必须标注 `// SIMPLIFIED(Mx):` 并登记在该里程碑清单中
 - 提交 `.sqlx/` 离线元数据
+- 直接在 `master` 上开发提交，不开特性分支（单人无远程，分支只带来合并开销）
 
 ## 第三方库外迁规则
 
