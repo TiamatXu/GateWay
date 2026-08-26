@@ -463,10 +463,7 @@ pub async fn rate_allow_spends_the_burst_then_denies(b: &dyn Backend) {
 
     // 补充速率 1/秒、桶容量 3：前三次拿满，第四次在补满前必然被拒
     for i in 0..3 {
-        assert!(
-            coord.rate_allow(&k, 1, 3).await.unwrap(),
-            "第 {i} 次应放行"
-        );
+        assert!(coord.rate_allow(&k, 1, 3).await.unwrap(), "第 {i} 次应放行");
     }
     assert!(!coord.rate_allow(&k, 1, 3).await.unwrap(), "桶空后应拒绝");
 }
@@ -528,7 +525,11 @@ pub async fn lock_is_reacquirable_after_release(b: &dyn Backend) {
 
     // pg 实现靠关闭连接释放，服务端观察到会话结束有微小延迟
     for _ in 0..50 {
-        if let Some(again) = coord.try_lock(&name, Duration::from_secs(30)).await.unwrap() {
+        if let Some(again) = coord
+            .try_lock(&name, Duration::from_secs(30))
+            .await
+            .unwrap()
+        {
             drop(again);
             return;
         }
@@ -573,13 +574,31 @@ pub const INITIAL: i64 = 1_000;
 #[derive(Debug, Clone)]
 pub enum Op {
     /// 单账户冻结
-    Hold { account: u8, amount: u16 },
+    Hold {
+        account: u8,
+        amount: u16,
+    },
     /// 两级账户链冻结，覆盖嵌套额度
-    HoldChain { child: u8, parent: u8, amount: u16 },
-    Capture { hold: u8, amount: u16 },
-    Void { hold: u8 },
-    Extend { hold: u8, delta: u16 },
-    Partial { hold: u8, amount: u16 },
+    HoldChain {
+        child: u8,
+        parent: u8,
+        amount: u16,
+    },
+    Capture {
+        hold: u8,
+        amount: u16,
+    },
+    Void {
+        hold: u8,
+    },
+    Extend {
+        hold: u8,
+        delta: u16,
+    },
+    Partial {
+        hold: u8,
+        amount: u16,
+    },
     Reclaim,
 }
 
@@ -632,11 +651,7 @@ async fn run(
             Op::Hold { account, amount } => {
                 let chain = vec![accounts[usize::from(*account % ACCOUNTS)]];
                 if let Ok(hold) = coord
-                    .hold(req(
-                        &chain,
-                        i64::from(*amount),
-                        &format!("{run_id}-{seq}"),
-                    ))
+                    .hold(req(&chain, i64::from(*amount), &format!("{run_id}-{seq}")))
                     .await
                 {
                     open.push(Open { hold, chain });
@@ -657,11 +672,7 @@ async fn run(
                 }
                 let chain = vec![c, p];
                 if let Ok(hold) = coord
-                    .hold(req(
-                        &chain,
-                        i64::from(*amount),
-                        &format!("{run_id}-{seq}"),
-                    ))
+                    .hold(req(&chain, i64::from(*amount), &format!("{run_id}-{seq}")))
                     .await
                 {
                     open.push(Open { hold, chain });
@@ -808,9 +819,10 @@ pub async fn concurrent_operations_preserve_invariants(b: &dyn Backend) {
         accounts.push(b.account(INITIAL).await);
     }
     let accounts = Arc::new(accounts);
-    let charged = Arc::new(std::sync::Mutex::new(
-        std::collections::HashMap::<AccountId, i64>::new(),
-    ));
+    let charged = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        AccountId,
+        i64,
+    >::new()));
 
     let mut tasks = tokio::task::JoinSet::new();
     for t in 0..TASKS {
@@ -865,10 +877,9 @@ pub async fn concurrent_operations_preserve_invariants(b: &dyn Backend) {
                     }
                     // 按实际扣
                     _ => {
-                        let actual = amount - i64::try_from(rng.below(
-                            u64::try_from(amount).unwrap_or(1),
-                        ))
-                        .unwrap_or(0);
+                        let actual = amount
+                            - i64::try_from(rng.below(u64::try_from(amount).unwrap_or(1)))
+                                .unwrap_or(0);
                         if coord.capture(hold, Money::from_nanos(actual)).await.is_ok() {
                             record(&charged, &chain, actual);
                         }
@@ -935,7 +946,10 @@ pub async fn rolling_rejects_non_rolling_timings(b: &dyn Backend) {
     let err = RollingHold::open(b.coord(), req(&chain, 100, &idem), policy)
         .await
         .expect_err("InRequest 不该开出滚动 Hold");
-    assert!(matches!(err, LedgerError::TimingNotRolling { .. }), "{err:?}");
+    assert!(
+        matches!(err, LedgerError::TimingNotRolling { .. }),
+        "{err:?}"
+    );
 }
 
 pub async fn rolling_charges_incrementally_without_closing(b: &dyn Backend) {
@@ -1015,7 +1029,10 @@ pub async fn rolling_stops_before_charging_when_funds_run_out(b: &dyn Backend) {
         .charge(Money::from_nanos(150))
         .await
         .expect_err("额度不足时不得扣款");
-    assert!(matches!(err, LedgerError::InsufficientFunds { .. }), "{err:?}");
+    assert!(
+        matches!(err, LedgerError::InsufficientFunds { .. }),
+        "{err:?}"
+    );
     assert_eq!(balances(b, a).await, (200, 100), "失败不得留下扣款痕迹");
 
     roll.abandon().await.unwrap();

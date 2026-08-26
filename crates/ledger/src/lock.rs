@@ -74,7 +74,13 @@ mod tests {
 
     #[test]
     fn advisory_key_is_stable_and_distinct() {
-        assert_eq!(advisory_key("ledger.reclaimer"), advisory_key("ledger.reclaimer"));
-        assert_ne!(advisory_key("ledger.reclaimer"), advisory_key("ledger.audit"));
+        assert_eq!(
+            advisory_key("ledger.reclaimer"),
+            advisory_key("ledger.reclaimer")
+        );
+        assert_ne!(
+            advisory_key("ledger.reclaimer"),
+            advisory_key("ledger.audit")
+        );
     }
 }

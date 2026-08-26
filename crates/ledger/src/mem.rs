@@ -357,20 +357,11 @@ impl Coordinator for MemCoordinator {
         })
     }
 
-    async fn rate_allow(
-        &self,
-        key: &RateKey,
-        rate: u32,
-        burst: u32,
-    ) -> Result<bool, LedgerError> {
+    async fn rate_allow(&self, key: &RateKey, rate: u32, burst: u32) -> Result<bool, LedgerError> {
         Ok(self.rate.allow(key, rate, burst))
     }
 
-    async fn try_lock(
-        &self,
-        key: &str,
-        ttl: Duration,
-    ) -> Result<Option<LockGuard>, LedgerError> {
+    async fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<LockGuard>, LedgerError> {
         let now = Utc::now();
         let mut held = self
             .locks
@@ -381,8 +372,8 @@ impl Coordinator for MemCoordinator {
         if held.get(key).is_some_and(|expires| *expires > now) {
             return Ok(None);
         }
-        let expires_at = now
-            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::hours(1));
+        let expires_at =
+            now + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::hours(1));
         held.insert(key.to_owned(), expires_at);
         drop(held);
 

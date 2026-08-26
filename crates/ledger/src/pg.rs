@@ -56,19 +56,14 @@ pub trait Coordinator: Send + Sync {
     async fn hold_stats(&self) -> Result<HoldStats, LedgerError>;
 
     /// 取一个令牌。`rate` 为每秒补充数，`burst` 为桶容量，任一为 0 即不限流。
-    async fn rate_allow(&self, key: &RateKey, rate: u32, burst: u32)
-    -> Result<bool, LedgerError>;
+    async fn rate_allow(&self, key: &RateKey, rate: u32, burst: u32) -> Result<bool, LedgerError>;
 
     /// 尝试取得分布式互斥，`None` 表示已被他人持有。释放靠 `LockGuard` 析构。
     ///
     /// `ttl` 是兜底释放时限，防止持有者崩溃后锁永久滞留。`pg` 实现用
     /// `pg_try_advisory_lock`，锁随连接生命周期释放——比 TTL 更及时，
     /// 故忽略该参数。
-    async fn try_lock(
-        &self,
-        key: &str,
-        ttl: Duration,
-    ) -> Result<Option<LockGuard>, LedgerError>;
+    async fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<LockGuard>, LedgerError>;
 }
 
 /// 活跃 Hold 的概览。年龄持续走高意味着有 Hold 迟迟不结算，是死冻结的前兆。
@@ -317,20 +312,11 @@ impl Coordinator for PgCoordinator {
         })
     }
 
-    async fn rate_allow(
-        &self,
-        key: &RateKey,
-        rate: u32,
-        burst: u32,
-    ) -> Result<bool, LedgerError> {
+    async fn rate_allow(&self, key: &RateKey, rate: u32, burst: u32) -> Result<bool, LedgerError> {
         Ok(self.rate.allow(key, rate, burst))
     }
 
-    async fn try_lock(
-        &self,
-        key: &str,
-        _ttl: Duration,
-    ) -> Result<Option<LockGuard>, LedgerError> {
+    async fn try_lock(&self, key: &str, _ttl: Duration) -> Result<Option<LockGuard>, LedgerError> {
         let mut conn = self.pool.acquire().await?;
         let got = sqlx::query_scalar!(
             r#"SELECT pg_try_advisory_lock($1) AS "got!""#,
