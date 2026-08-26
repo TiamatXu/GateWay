@@ -1,0 +1,166 @@
+# 火山引擎。M2 的表达力压测对象——三家同类网关全部不支持的端点族，
+# 同时踩中不同 host、签名鉴权、跨端点句柄引用、二进制上传四个难点。
+#
+# 除 chat 外的端点当前解释器未实现（需 M3），加载时会被标为延期、
+# 不挂入站路由，但必须通过全部三层校验。
+schema_version: 1
+provider: volcengine
+
+defaults:
+  base_url: https://ark.cn-beijing.volces.com
+  protocol: openai_chat
+  auth:
+    credential: static
+    inject:
+      header:
+        name: authorization
+        template: "Bearer {credential}"
+
+anchors:
+  # 资产库走原生接口，与 chat 不同 host、不同鉴权：AK/SK 请求签名
+  aksk_auth: &aksk_auth
+    credential: static
+    inject:
+      sign:
+        alg: volc_v4
+        service: cv
+        region: cn-beijing
+
+endpoints:
+  # ---- 同步 chat：M2 可跑 ----
+  - id: chat_completions
+    shape:
+      request: json
+      response: sse
+      handle: none
+      billing: in_request
+      retry: safe
+    route:
+      method: POST
+      inbound:  /volcengine/api/v3/chat/completions
+      upstream: /api/v3/chat/completions
+    model: "$.model"
+    stream_flag: "$.stream"
+    usage:
+      estimate:
+        - dim: input_tokens
+          read: "$.messages[*].content"
+          tokenize: cl100k_base
+      actual:
+        - { dim: input_tokens,  read: "$.usage.prompt_tokens",     accum: last }
+        - { dim: output_tokens, read: "$.usage.completion_tokens", accum: last }
+
+  # ---- 难点 1+2+4：不同 host、AK/SK 签名、二进制上传 ----
+  - id: asset_upload
+    shape:
+      request: json_then_binary       # 先签名换直传地址，再传二进制
+      response: json
+      handle: { issues: asset }
+      billing: metered                # 资产按存续时长计费
+      retry: unsafe
+    route:
+      method: POST
+      base_url: https://open.volcengineapi.com    # 覆盖 provider 默认 host
+      inbound:  /volcengine/assets/upload
+      upstream: /
+      query:
+        Action: UploadAsset
+        Version: "2024-06-06"
+    auth: *aksk_auth
+    handles:
+      issue:
+        - { at: "$.Result.AssetId", kind: asset }
+    usage:
+      estimate:
+        - { dim: storage_byte_seconds, read: "$.size_bytes", scale: 86400 }
+      actual:
+        - { dim: storage_byte_seconds, read: "$.Result.SizeBytes", scale: 86400 }
+
+  - id: asset_delete
+    shape:
+      request: json
+      response: json
+      handle: { terminates: asset }
+      billing: not_billed
+      retry: safe
+    route:
+      method: POST
+      base_url: https://open.volcengineapi.com
+      inbound:  /volcengine/assets/{asset_id}/delete
+      upstream: /
+      query:
+        Action: DeleteAsset
+        Version: "2024-06-06"
+    auth: *aksk_auth
+    handles:
+      consume:
+        - { at: "path.asset_id", kind: asset }
+
+  # ---- 难点 3：本端点签发 Task，同时在请求体里消费另一端点签发的 Asset ----
+  - id: video_generation_submit
+    shape:
+      request: json
+      response: json
+      handle: { issues: task }        # 粗粒度：主关系是签发任务
+      billing: on_terminal
+      retry: idempotent_with_key
+    route:
+      method: POST
+      inbound:  /volcengine/api/v3/contents/generations/tasks
+      upstream: /api/v3/contents/generations/tasks
+    model: "$.model"
+    handles:
+      issue:
+        - { at: "$.id", kind: task }
+      consume:
+        # asset:// 出现在请求体的内容数组里，不是路径参数
+        - { at: "$.content[0].image_url.url", kind: asset }
+    async:
+      poll:   video_task_query
+      cancel: video_task_cancel
+      state:  "$.status"
+      terminal:
+        succeeded: [succeeded]
+        failed:    [failed, canceled]
+    usage:
+      estimate:
+        - { dim: audio_millis, read: "$.duration", default: 5, scale: 1000 }
+        - dim: images
+          read: "$.ratio"
+          map: { "16:9": 2073600, "9:16": 2073600, "1:1": 1048576 }
+          default: 1048576
+      on_submit:
+        - { dim: audio_millis, read: "$.usage.duration_ms", accum: last }
+      actual:
+        - { dim: audio_millis, read: "$.usage.duration_ms",     accum: last }
+        - { dim: images,       read: "$.usage.total_pixels",    accum: last }
+
+  - id: video_task_query
+    shape:
+      request: none
+      response: json
+      handle: { consumes: task }
+      billing: not_billed
+      retry: safe
+    route:
+      method: GET
+      inbound:  /volcengine/api/v3/contents/generations/tasks/{task_id}
+      upstream: /api/v3/contents/generations/tasks/{task_id}
+    handles:
+      consume:
+        - { at: "path.task_id", kind: task }
+
+  - id: video_task_cancel
+    shape:
+      request: none
+      response: json
+      handle: { terminates: task }
+      billing: not_billed
+      retry: safe
+    route:
+      method: DELETE
+      inbound:  /volcengine/api/v3/contents/generations/tasks/{task_id}
+      upstream: /api/v3/contents/generations/tasks/{task_id}
+    handles:
+      consume:
+        - { at: "path.task_id", kind: task }

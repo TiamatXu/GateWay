@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, base_url, credential FROM channel WHERE enabled ORDER BY id LIMIT 1",
+  "query": "SELECT id, provider, base_url, credential FROM channel WHERE enabled AND provider = ANY($1) ORDER BY id LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -10,23 +10,31 @@
       },
       {
         "ordinal": 1,
-        "name": "base_url",
+        "name": "provider",
         "type_info": "Text"
       },
       {
         "ordinal": 2,
+        "name": "base_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
         "name": "credential",
         "type_info": "Bytea"
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "TextArray"
+      ]
     },
     "nullable": [
+      false,
       false,
       false,
       false
     ]
   },
-  "hash": "83719c7ae2886bda420d2f30cfda97f4a8aa9547fac14c2008348d7d80cd0cb9"
+  "hash": "7012ad34c4383e08309c328d444addebf32c8c9e7b47218dc5c49b7365362d7e"
 }

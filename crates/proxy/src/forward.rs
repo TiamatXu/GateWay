@@ -1,7 +1,7 @@
 //! 上游转发。贴着 hyper 走，避免高层封装引入 body 缓冲。
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Request, Response};
+use http::{HeaderMap, Request, Response};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
@@ -38,13 +38,12 @@ pub enum ProxyError {
 
 /// 构造发往上游的请求头。
 ///
-/// `channel_credential` 为 `None` 时不带任何凭据——绝不回退到客户端凭据。
+/// 剥离逐跳头与客户端凭据后，覆盖上 `inject` 里的头。凭据注入到哪个头、
+/// 用什么格式，由 Provider 描述文件决定，不在这里硬编码——
+/// `inject` 为空时不带任何凭据，绝不回退到客户端凭据。
 #[must_use]
-pub fn prepare_upstream_headers(
-    incoming: &HeaderMap,
-    channel_credential: Option<&str>,
-) -> HeaderMap {
-    let mut out = HeaderMap::with_capacity(incoming.len() + 1);
+pub fn prepare_upstream_headers(incoming: &HeaderMap, inject: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::with_capacity(incoming.len() + inject.len());
     for (name, value) in incoming {
         let n = name.as_str();
         // host 由上游地址决定，照抄会打到错误的虚拟主机
@@ -53,10 +52,8 @@ pub fn prepare_upstream_headers(
         }
         out.append(name.clone(), value.clone());
     }
-    if let Some(cred) = channel_credential
-        && let Ok(v) = HeaderValue::from_str(cred)
-    {
-        out.insert(HeaderName::from_static("authorization"), v);
+    for (name, value) in inject {
+        out.insert(name.clone(), value.clone());
     }
     out
 }
@@ -127,7 +124,7 @@ mod tests {
                 ("proxy-authorization", "basic"),
                 ("content-type", "application/json"),
             ]),
-            None,
+            &HeaderMap::new(),
         );
 
         assert_eq!(out.len(), 1);
@@ -136,30 +133,46 @@ mod tests {
 
     /// 客户端的凭据绝不能透传给上游——那是我们的 key，不是他们的
     #[test]
-    fn replaces_client_credentials_with_the_channel_credential() {
+    fn replaces_client_credentials_with_the_injected_ones() {
         let out = prepare_upstream_headers(
             &headers(&[
                 ("authorization", "Bearer sk-user-key"),
                 ("x-api-key", "user-key"),
             ]),
-            Some("Bearer sk-channel-key"),
+            &headers(&[("authorization", "Bearer sk-channel-key")]),
         );
 
         assert_eq!(out.get("authorization").unwrap(), "Bearer sk-channel-key");
         assert!(out.get("x-api-key").is_none());
     }
 
+    /// 注入的头不必是 authorization——Anthropic 用 x-api-key，由描述文件决定
+    #[test]
+    fn injects_whatever_header_the_descriptor_names() {
+        let out = prepare_upstream_headers(
+            &headers(&[("authorization", "Bearer sk-user")]),
+            &headers(&[("x-api-key", "sk-ant"), ("anthropic-version", "2023-06-01")]),
+        );
+        assert_eq!(out.get("x-api-key").unwrap(), "sk-ant");
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+        assert!(out.get("authorization").is_none());
+    }
+
     /// 渠道未配置凭据时不得把客户端凭据漏出去
     #[test]
-    fn drops_client_credentials_when_channel_has_none() {
-        let out = prepare_upstream_headers(&headers(&[("authorization", "Bearer sk-user")]), None);
+    fn drops_client_credentials_when_nothing_is_injected() {
+        let out = prepare_upstream_headers(
+            &headers(&[("authorization", "Bearer sk-user")]),
+            &HeaderMap::new(),
+        );
         assert!(out.get("authorization").is_none());
     }
 
     /// host 由上游地址决定，照抄客户端的会打到错误的虚拟主机
     #[test]
     fn strips_host_header() {
-        let out = prepare_upstream_headers(&headers(&[("host", "gateway.local")]), None);
+        let out =
+            prepare_upstream_headers(&headers(&[("host", "gateway.local")]), &HeaderMap::new());
         assert!(out.get("host").is_none());
     }
 
@@ -167,7 +180,7 @@ mod tests {
     fn preserves_unrelated_headers() {
         let out = prepare_upstream_headers(
             &headers(&[("accept", "text/event-stream"), ("user-agent", "curl/8")]),
-            None,
+            &HeaderMap::new(),
         );
         assert_eq!(out.get("accept").unwrap(), "text/event-stream");
         assert_eq!(out.get("user-agent").unwrap(), "curl/8");

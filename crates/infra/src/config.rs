@@ -17,10 +17,17 @@ pub struct Config {
     /// 无合理默认值：缺失必须报错，不能静默连到某处
     pub database_url: String,
     pub db_max_connections: u32,
+    /// Provider 描述文件目录。端点全部由这里的 YAML 声明。
+    #[serde(default = "default_providers_dir")]
+    pub providers_dir: String,
     #[serde(default)]
     pub load: LoadConfig,
     #[serde(default)]
     pub log: LogConfig,
+}
+
+fn default_providers_dir() -> String {
+    "providers".to_owned()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

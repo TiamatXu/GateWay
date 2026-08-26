@@ -9,8 +9,21 @@ publish.workspace = true
 [dependencies]
 gw-core = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+serde_json_path = { workspace = true }
+serde-saphyr = { workspace = true }
+matchit = { workspace = true }
+arc-swap = { workspace = true }
+schemars = { workspace = true, optional = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+schema = ["dep:schemars", "gw-core/schema"]
+
+[dev-dependencies]
+rstest = { workspace = true }
 
 [lints]
 workspace = true

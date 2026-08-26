@@ -1,0 +1,100 @@
+# OpenAI。第一批描述文件驱动的 provider。
+schema_version: 1
+provider: openai
+
+defaults:
+  base_url: https://api.openai.com
+  protocol: openai_chat
+  auth:
+    credential: static
+    inject:
+      header:
+        name: authorization
+        template: "Bearer {credential}"
+
+# 锚点存放处：内容不参与解析，只为让下面的端点共享声明
+anchors:
+  json_sse: &json_sse
+    request: json
+    response: sse
+    handle: none
+    billing: in_request
+    retry: safe
+
+  json_json: &json_json
+    request: json
+    response: json
+    handle: none
+    billing: in_request
+    retry: safe
+
+  # estimate 读请求体文本按 o200k 计数用于预扣；actual 读上游权威 usage；
+  # fallback 只在权威 usage 缺席（客户端中途断连，末帧从未到达）时生效
+  chat_usage: &chat_usage
+    estimate:
+      - dim: input_tokens
+        read: "$.messages[*].content"
+        tokenize: o200k_base
+      # 两条同维度规则：只有后者命中时后者生效，否则前者生效。
+      # 这样两个别名不必在数据平面里写 or_else 分支。
+      - { dim: max_output_tokens, read: "$.max_tokens" }
+      - { dim: max_output_tokens, read: "$.max_completion_tokens" }
+    actual:
+      - { dim: input_tokens,     read: "$.usage.prompt_tokens",                       accum: last }
+      - { dim: output_tokens,    read: "$.usage.completion_tokens",                   accum: last }
+      - { dim: cached_input,     read: "$.usage.prompt_tokens_details.cached_tokens", accum: last }
+      - { dim: reasoning_tokens, read: "$.usage.completion_tokens_details.reasoning_tokens", accum: last }
+    fallback:
+      - dim: output_tokens
+        read: "$.choices[*].delta.content"
+        tokenize: o200k_base
+
+endpoints:
+  - id: chat_completions
+    shape: *json_sse
+    route:
+      method: POST
+      inbound:  /v1/chat/completions
+      upstream: /v1/chat/completions
+    model: "$.model"
+    stream_flag: "$.stream"
+    usage: *chat_usage
+
+  - id: responses
+    shape: *json_sse
+    protocol: openai_responses
+    route:
+      method: POST
+      inbound:  /v1/responses
+      upstream: /v1/responses
+    model: "$.model"
+    stream_flag: "$.stream"
+    usage:
+      estimate:
+        - dim: input_tokens
+          read: "$.input"
+          tokenize: o200k_base
+        - { dim: max_output_tokens, read: "$.max_output_tokens" }
+      actual:
+        - { dim: input_tokens,  read: "$.usage.input_tokens",  accum: last }
+        - { dim: output_tokens, read: "$.usage.output_tokens", accum: last }
+        - { dim: cached_input,  read: "$.usage.input_tokens_details.cached_tokens", accum: last }
+      fallback:
+        - dim: output_tokens
+          read: "$.delta"
+          tokenize: o200k_base
+
+  - id: embeddings
+    shape: *json_json
+    route:
+      method: POST
+      inbound:  /v1/embeddings
+      upstream: /v1/embeddings
+    model: "$.model"
+    usage:
+      estimate:
+        - dim: input_tokens
+          read: "$.input"
+          tokenize: o200k_base
+      actual:
+        - { dim: input_tokens, read: "$.usage.prompt_tokens", accum: last }

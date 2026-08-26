@@ -4,31 +4,31 @@
 //! 本地原子读（准入）→ 主键查询（鉴权）→ 路由 → PG 写（冻结）→ 转发。
 //! 过载时应在最便宜的位置拒绝，而非查库之后。
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use bytes::Bytes;
 use chrono::Utc;
 use futures::TryStreamExt;
-use gw_core::{BillingTiming, ChannelId, ProtocolKind, RequestId};
+use gw_core::{ChannelId, ProtocolKind, ProviderId, RequestId, dims};
 use gw_ledger::{Coordinator, HoldRequest, LedgerError};
-use gw_meter::{
-    Accum, JsonUsageExtractor, RequestTokenCounter, SseUsageExtractor, TextSpec, Tokenizer,
-    UsageSpec,
-};
+use gw_meter::{JsonUsageExtractor, SseUsageExtractor};
 use gw_pricing::{PriceCtx, PriceEngine};
 use gw_proxy::{Tee, TeeStream, Upstream, prepare_upstream_headers};
+use gw_registry::{EndpointDesc, InboundMatch, Locator, Method};
 use http_body_util::{BodyStream, Full};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::admission::{Admission, InflightToken, RejectReason};
+use crate::endpoint::Endpoints;
 use crate::settlement::{SettlementCtx, Settler};
 use crate::{LoadGuard, authenticate, error_body, extract_bearer};
 
@@ -57,6 +57,7 @@ pub struct AppState {
     pub pricing: Arc<dyn PriceEngine>,
     pub settler: Arc<Settler>,
     pub upstream: Upstream,
+    pub endpoints: Arc<Endpoints>,
     pub config: GatewayConfig,
 }
 
@@ -67,7 +68,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // readyz 只反映结构性状态，不反映瞬时负载：过载时摘节点会把流量压向
         // 其余节点引发雪崩。过载只在请求路径上返回 503。
         .route("/readyz", get(readyz))
-        .route("/v1/{*path}", post(proxy_request))
+        // 入站路径由描述文件声明，这里只兜住全部路径交给目录去匹配
+        .route("/{*path}", any(proxy_request))
         .layer(DefaultBodyLimit::max(limit))
         .with_state(state)
 }
@@ -79,15 +81,6 @@ async fn readyz(State(st): State<Arc<AppState>>) -> Response {
             tracing::warn!(error = %e, "readyz: 数据库不可达");
             (StatusCode::SERVICE_UNAVAILABLE, "database unreachable").into_response()
         }
-    }
-}
-
-/// M0 只识别 `OpenAI` 兼容协议；`Native` 由 M2 的描述文件决定。
-fn protocol_of(path: &str) -> ProtocolKind {
-    if path.starts_with("/v1/responses") {
-        ProtocolKind::OpenAiResponses
-    } else {
-        ProtocolKind::OpenAiChat
     }
 }
 
@@ -120,52 +113,71 @@ impl Reject {
     }
 }
 
-/// 用量抽取规则与输入计数路径。JSONPath 解析一次即可，不在请求路径上重复做。
-/// M1 硬编码 `OpenAI` 兼容协议，M2 起由描述文件提供。
-static USAGE_SPEC: LazyLock<Arc<UsageSpec>> = LazyLock::new(|| Arc::new(openai_usage_spec()));
-static INPUT_SPEC: LazyLock<TextSpec> = LazyLock::new(RequestTokenCounter::openai_chat);
-
-fn openai_usage_spec() -> UsageSpec {
-    UsageSpec::new()
-        .rule(
-            gw_core::dims::INPUT_TOKENS,
-            "$.usage.prompt_tokens",
-            Accum::Last,
-        )
-        .and_then(|s| {
-            s.rule(
-                gw_core::dims::OUTPUT_TOKENS,
-                "$.usage.completion_tokens",
-                Accum::Last,
-            )
-        })
-        .and_then(|s| {
-            s.text_fallback(
-                gw_core::dims::OUTPUT_TOKENS,
-                "$.choices[*].delta.content",
-                Tokenizer::O200kBase,
-            )
-        })
-        .expect("内置 JSONPath 必然合法")
-}
-
 async fn proxy_request(
     State(st): State<Arc<AppState>>,
+    method: axum::http::Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let path = uri.path().to_owned();
-    let protocol = protocol_of(&path);
-    match handle(&st, &path, &headers, body).await {
+    let (catalog, specs) = st.endpoints.snapshot();
+    let Some(method) = to_catalog_method(&method) else {
+        return reject(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "unsupported_method",
+            "该方法未被任何端点声明",
+        )
+        .into_response(&ProtocolKind::OpenAiChat);
+    };
+    // 错误体的协议形态也来自声明：匹配不到就退回 OpenAI 兼容格式
+    let protocol = catalog
+        .resolve(method, &path)
+        .map_or(ProtocolKind::OpenAiChat, |m| m.route.protocol.clone());
+
+    match handle(&st, &catalog, &specs, method, &path, &headers, body).await {
         Ok(resp) => resp,
         Err(r) => r.into_response(&protocol),
+    }
+}
+
+fn to_catalog_method(m: &axum::http::Method) -> Option<Method> {
+    Some(match *m {
+        axum::http::Method::GET => Method::Get,
+        axum::http::Method::POST => Method::Post,
+        axum::http::Method::PUT => Method::Put,
+        axum::http::Method::PATCH => Method::Patch,
+        axum::http::Method::DELETE => Method::Delete,
+        _ => return None,
+    })
+}
+
+/// 按声明的位置取一个字符串值。三种前缀是封闭集合，无需分支到厂商。
+fn read_locator(
+    loc: &Locator,
+    doc: &serde_json::Value,
+    params: &HashMap<smol_str::SmolStr, String>,
+    headers: &HeaderMap,
+) -> Option<String> {
+    match loc {
+        Locator::Body(p) => p.one(doc).map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }),
+        Locator::PathParam(n) => params.get(n).cloned(),
+        Locator::Header(n) => headers
+            .get(n.as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
     }
 }
 
 #[allow(clippy::too_many_lines)]
 async fn handle(
     st: &Arc<AppState>,
+    catalog: &gw_registry::Catalog,
+    specs: &crate::endpoint::SpecTable,
+    method: Method,
     path: &str,
     headers: &HeaderMap,
     body: Bytes,
@@ -216,38 +228,58 @@ async fn handle(
         reject(StatusCode::UNAUTHORIZED, "invalid_api_key", "API Key 无效")
     })?;
 
-    // 3. 路由。M0 读取 body 取 model——OpenAI 兼容协议的 model 只在 body 里。
-    let doc: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+    // 3. 入站解析。端点身份、协议、model 位置、计费时点全部来自描述文件。
+    let matched = catalog.resolve(method, path).ok_or_else(|| {
         reject(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("请求体不是合法 JSON: {e}"),
+            StatusCode::NOT_FOUND,
+            "unknown_endpoint",
+            "没有描述文件声明这个端点",
         )
     })?;
-    let model = doc
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
+
+    // 请求体可能为空（RequestForm::None 的端点），空体按 null 处理而非报错
+    let doc: serde_json::Value = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
             reject(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "请求体缺少 model 字段",
+                format!("请求体不是合法 JSON: {e}"),
             )
         })?
-        .to_owned();
-    let streaming = doc
-        .get("stream")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let max_output_tokens = doc
-        .get("max_tokens")
-        .or_else(|| doc.get("max_completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok());
+    };
 
-    // SIMPLIFIED(M0): 单渠道直连，无过滤与打分。M3 接入路由策略。
+    let model = match &matched.route.model {
+        Some(loc) => Some(
+            read_locator(loc, &doc, &matched.params, headers).ok_or_else(|| {
+                reject(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("请求里取不到 model（声明位置 {loc}）"),
+                )
+            })?,
+        ),
+        None => None,
+    };
+    let streaming = matched
+        .route
+        .stream_flag
+        .as_ref()
+        .and_then(|loc| read_locator(loc, &doc, &matched.params, headers))
+        .is_some_and(|v| v == "true");
+
+    // 4. 选渠道。只在承接该入站路径的 provider 里选。
+    // SIMPLIFIED(M0): 无过滤与打分，M3 接入路由策略。
+    let providers: Vec<String> = matched
+        .route
+        .providers()
+        .map(|p| p.as_str().to_owned())
+        .collect();
     let channel = sqlx::query!(
-        "SELECT id, base_url, credential FROM channel WHERE enabled ORDER BY id LIMIT 1"
+        "SELECT id, provider, base_url, credential FROM channel \
+         WHERE enabled AND provider = ANY($1) ORDER BY id LIMIT 1",
+        &providers
     )
     .fetch_optional(&st.pool)
     .await
@@ -267,7 +299,25 @@ async fn handle(
         )
     })?;
 
-    // 4. 预扣。
+    let provider = ProviderId(channel.provider.as_str().into());
+    let desc = matched.binding(&provider).ok_or_else(|| {
+        tracing::error!(provider = %channel.provider, path, "渠道的 provider 未绑定该端点");
+        reject(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "内部错误",
+        )
+    })?;
+    let endpoint_specs = specs.get(desc).ok_or_else(|| {
+        tracing::error!(endpoint = %desc.id, "规则表缺少该端点");
+        reject(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "内部错误",
+        )
+    })?;
+
+    // 5. 预扣。估算规则读请求体，计费时点来自端点形态。
     let request_id = RequestId(Uuid::new_v4());
     let started_at = Utc::now();
 
@@ -281,17 +331,21 @@ async fn handle(
             || format!("req:{request_id}"),
             |v| format!("idem:{}:{v}", principal.key_id.0),
         );
+    let estimate = endpoint_specs.estimate.evaluate(&doc);
+    let model = model.unwrap_or_default();
     let price_ctx = PriceCtx {
         model: &model,
         channel: ChannelId(channel.id),
         tier: "default",
         endpoint: path,
         at: started_at,
-        max_output_tokens,
-        // 请求体已在内存中，直接数出真实输入量；取不到时退回配置上限
-        input_tokens: INPUT_SPEC.count(&body),
+        max_output_tokens: u32::try_from(estimate.get(dims::MAX_OUTPUT_TOKENS))
+            .ok()
+            .filter(|v| *v > 0),
+        // 请求体已在内存中，估算规则直接数出真实输入量
+        input_tokens: Some(estimate.get(dims::INPUT_TOKENS)).filter(|v| *v > 0),
     };
-    let estimate = st.pricing.estimate_max(&price_ctx).await.map_err(|e| {
+    let max_cost = st.pricing.estimate_max(&price_ctx).await.map_err(|e| {
         tracing::warn!(model = %model, error = %e, "预扣估算失败");
         reject(
             StatusCode::BAD_REQUEST,
@@ -304,10 +358,10 @@ async fn handle(
         .coord
         .hold(HoldRequest {
             chain: &principal.account_chain,
-            amount: estimate,
+            amount: max_cost,
             ttl: st.config.hold_ttl,
             idempotency_key: &idempotency_key,
-            timing: BillingTiming::InRequest,
+            timing: desc.shape.billing,
         })
         .await
         .map_err(|e| match e {
@@ -331,22 +385,24 @@ async fn handle(
             }
         })?;
 
-    // 5. 转发。body 已在内存中（JSON 端点），响应流不缓冲。
-    let credential = String::from_utf8(channel.credential).ok();
-    let uri = format!("{}{}", channel.base_url.trim_end_matches('/'), path);
+    // 6. 转发。上游地址、方法、注入的头全部来自描述文件。
+    // 渠道的 base_url 覆盖描述文件的默认值——描述文件给的是厂商官方地址，
+    // 渠道可能指向自建代理或另一个地域。
+    let credential = String::from_utf8(channel.credential).unwrap_or_default();
+    let uri = build_upstream_uri(&matched, desc, &channel.base_url, &credential)?;
     let mut req = axum::http::Request::builder()
-        .method("POST")
+        .method(desc.method.as_str())
         .uri(&uri)
         .body(Full::new(body))
         .map_err(|e| {
-            tracing::error!(error = %e, "构造上游请求失败");
+            tracing::error!(error = %e, uri = %uri, "构造上游请求失败");
             reject(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "内部错误",
             )
         })?;
-    *req.headers_mut() = prepare_upstream_headers(headers, credential.as_deref());
+    *req.headers_mut() = prepare_upstream_headers(headers, &upstream_headers(desc, &credential)?);
 
     let upstream_resp = match st.upstream.send(req).await {
         Ok(r) => r,
@@ -364,7 +420,7 @@ async fn handle(
         }
     };
 
-    // 6. tee 旁路 + 结算哨兵。响应头此时才可知，故在此构造结算上下文。
+    // 7. tee 旁路 + 结算哨兵。响应头此时才可知，故在此构造结算上下文。
     let ctx = SettlementCtx {
         request_id,
         key_id: Some(principal.key_id),
@@ -385,10 +441,11 @@ async fn handle(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"));
 
+    let spec = Arc::clone(&endpoint_specs.response);
     let extractor: Box<dyn gw_core::UsageExtractor> = if is_sse {
-        Box::new(SseUsageExtractor::new(Arc::clone(&USAGE_SPEC)))
+        Box::new(SseUsageExtractor::new(spec))
     } else {
-        Box::new(JsonUsageExtractor::new(Arc::clone(&USAGE_SPEC)))
+        Box::new(JsonUsageExtractor::new(spec))
     };
     let tee = Arc::new(Mutex::new(Tee::new(extractor)));
     let guard = crate::SettlementGuard::new(hold, Arc::clone(&tee), ctx, Arc::clone(&st.settler));
@@ -417,6 +474,70 @@ async fn handle(
     Ok(out
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
+/// 拼上游 URL：渠道地址 + 渲染后的上游路径 + 声明的查询参数。
+fn build_upstream_uri(
+    matched: &InboundMatch<'_>,
+    desc: &EndpointDesc,
+    channel_base_url: &str,
+    credential: &str,
+) -> Result<String, Reject> {
+    let path = matched.upstream_path(desc).map_err(|e| {
+        tracing::error!(endpoint = %desc.id, error = %e, "渲染上游路径失败");
+        reject(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "内部错误",
+        )
+    })?;
+    let mut uri = format!("{}{}", channel_base_url.trim_end_matches('/'), path);
+
+    let mut query: Vec<(String, String)> = desc.query.clone();
+    if let Ok(gw_registry::Injected::Query { name, value }) =
+        gw_registry::inject(&desc.auth, credential)
+    {
+        query.push((name, value));
+    }
+    if !query.is_empty() {
+        let joined = query
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        uri.push(if uri.contains('?') { '&' } else { '?' });
+        uri.push_str(&joined);
+    }
+    Ok(uri)
+}
+
+/// 注入上游的头：描述文件声明的固定头，加上凭证注入。
+fn upstream_headers(desc: &EndpointDesc, credential: &str) -> Result<HeaderMap, Reject> {
+    let mut out = HeaderMap::new();
+    let mut put = |name: &str, value: &str| {
+        if let (Ok(n), Ok(v)) = (HeaderName::try_from(name), HeaderValue::from_str(value)) {
+            out.insert(n, v);
+        } else {
+            tracing::warn!(endpoint = %desc.id, name, "声明的头名或值不合法，已跳过");
+        }
+    };
+    for (name, value) in &desc.headers {
+        put(name, value);
+    }
+    if !credential.is_empty()
+        && let gw_registry::Injected::Header { name, value } =
+            gw_registry::inject(&desc.auth, credential).map_err(|e| {
+                tracing::error!(endpoint = %desc.id, error = %e, "凭证注入失败");
+                reject(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "内部错误",
+                )
+            })?
+    {
+        put(&name, &value);
+    }
+    Ok(out)
 }
 
 /// 随响应流一同析构的两样东西：结算哨兵与并发名额。

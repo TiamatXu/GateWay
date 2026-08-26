@@ -1,0 +1,46 @@
+# Anthropic。与 openai 共用 /v1/chat/completions 的兼容入口，
+# 同时暴露原生 /anthropic/v1/messages——透传优先下 Native 是常态而非例外。
+schema_version: 1
+provider: anthropic
+
+defaults:
+  base_url: https://api.anthropic.com
+  protocol: anthropic_messages
+  auth:
+    credential: static
+    inject:
+      header:
+        name: x-api-key
+        template: "{credential}"
+
+endpoints:
+  - id: messages
+    shape:
+      request: json
+      response: sse
+      handle: none
+      billing: in_request
+      retry: safe
+    route:
+      method: POST
+      inbound:  /anthropic/v1/messages
+      upstream: /v1/messages
+      headers:
+        anthropic-version: "2023-06-01"
+    model: "$.model"
+    stream_flag: "$.stream"
+    usage:
+      estimate:
+        - dim: input_tokens
+          read: "$.messages[*].content"
+          tokenize: cl100k_base
+      actual:
+        # Anthropic 的 usage 分散在 message_start 与 message_delta 两类事件里
+        - { dim: input_tokens,  read: "$.message.usage.input_tokens",       accum: last }
+        - { dim: output_tokens, read: "$.usage.output_tokens",              accum: last }
+        - { dim: cache_write,   read: "$.message.usage.cache_creation_input_tokens", accum: last }
+        - { dim: cached_input,  read: "$.message.usage.cache_read_input_tokens",     accum: last }
+      fallback:
+        - dim: output_tokens
+          read: "$.delta.text"
+          tokenize: cl100k_base

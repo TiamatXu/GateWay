@@ -14,11 +14,12 @@ use gw_gateway::LoadProbe;
 use gw_gateway::admission::LoadGuardConfig;
 use gw_gateway::app::{AppState, GatewayConfig};
 use gw_gateway::settlement::Settler;
-use gw_gateway::{CgroupProbe, LoadGuard, PgLogSink, spawn_log_writer};
+use gw_gateway::{CgroupProbe, Endpoints, LoadGuard, PgLogSink, spawn_log_writer};
 use gw_infra::Config;
 use gw_ledger::{Coordinator, PgCoordinator};
 use gw_pricing::{EstimateCeilings, PgPriceEngine};
 use gw_proxy::Upstream;
+use gw_registry::HookRegistry;
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -39,6 +40,12 @@ async fn main() -> anyhow::Result<()> {
         EstimateCeilings::default(),
     ));
     let settler = Arc::new(Settler::new(coord.clone(), pricing.clone(), log_tx.clone()));
+
+    // 描述文件在启动期加载并校验：跑不起来的目录应当立刻暴露，而不是等第一个请求
+    let endpoints = Arc::new(
+        Endpoints::open(&config.providers_dir, HookRegistry::new())
+            .with_context(|| format!("加载描述文件目录 {} 失败", config.providers_dir))?,
+    );
 
     let probe = CgroupProbe::new();
     let load = Arc::new(LoadGuard::new(load_config(&config, &probe)));
@@ -64,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         pricing,
         settler: Arc::clone(&settler),
         upstream: Upstream::new(),
+        endpoints,
         config: GatewayConfig::default(),
     });
 

@@ -1,0 +1,762 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Descriptor",
+  "description": "一个 provider 一个文件。",
+  "type": "object",
+  "properties": {
+    "anchors": {
+      "description": "锚点存放处。内容不参与解析，只为让端点之间共享 YAML 锚点\n（`deny_unknown_fields` 下需要一个合法的落脚点）。",
+      "default": null
+    },
+    "defaults": {
+      "description": "provider 级默认值，任意端点可覆盖",
+      "$ref": "#/$defs/Defaults"
+    },
+    "endpoints": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EndpointDef"
+      }
+    },
+    "provider": {
+      "$ref": "#/$defs/ProviderId"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "provider",
+    "endpoints"
+  ],
+  "$defs": {
+    "Accum": {
+      "description": "同一维度多次命中时的累积方式。描述文件的 `accum` 算子。",
+      "oneOf": [
+        {
+          "description": "上游上报累计值，后值覆盖前值",
+          "type": "string",
+          "const": "last"
+        },
+        {
+          "description": "上游上报增量，逐帧累加",
+          "type": "string",
+          "const": "sum"
+        }
+      ]
+    },
+    "AsyncDef": {
+      "description": "提交与轮询是各自独立声明的两个端点，在提交端点上显式引用。\n不靠 `HandleKind` 隐式匹配——一个 provider 有两个任务族时会静默歧义。",
+      "type": "object",
+      "properties": {
+        "cancel": {
+          "description": "取消端点 id，形态须为 `Terminates(Task)`",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "poll": {
+          "description": "轮询端点 id，加载期校验存在且形态为 `Consumes(Task)`",
+          "type": "string"
+        },
+        "state": {
+          "description": "任务状态字段的位置",
+          "$ref": "#/$defs/Locator"
+        },
+        "terminal": {
+          "$ref": "#/$defs/TerminalStates"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "poll",
+        "state",
+        "terminal"
+      ]
+    },
+    "AuthDef": {
+      "description": "凭证的获取与附加正交：`credential` 可能做 IO、有缓存、渠道级；\n`inject` 是纯函数、请求级。签名是 `inject` 的一个变体——\n签名的本质就是把凭证附加到请求上，只是附加方式复杂。",
+      "type": "object",
+      "properties": {
+        "credential": {
+          "$ref": "#/$defs/CredentialDef"
+        },
+        "inject": {
+          "$ref": "#/$defs/InjectDef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "inject"
+      ]
+    },
+    "BillingTiming": {
+      "type": "string",
+      "enum": [
+        "in_request",
+        "on_terminal",
+        "metered",
+        "session",
+        "not_billed"
+      ]
+    },
+    "CredentialDef": {
+      "description": "凭证怎么来。有限枚举加参数，不是 hook——\ntoken 换取需要渠道级缓存与刷新，无状态 hook 装不下。",
+      "oneOf": [
+        {
+          "description": "渠道凭证原样使用",
+          "type": "string",
+          "const": "static"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "oauth2_client_credentials": {
+              "$ref": "#/$defs/Oauth2Def"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "oauth2_client_credentials"
+          ]
+        }
+      ]
+    },
+    "Defaults": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthDef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "base_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "protocol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "EndpointDef": {
+      "type": "object",
+      "properties": {
+        "async": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AsyncDef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "auth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthDef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "handles": {
+          "$ref": "#/$defs/HandlesDef"
+        },
+        "id": {
+          "description": "端点标识，provider 内唯一。`async.poll` 等交叉引用用它。",
+          "type": "string"
+        },
+        "model": {
+          "description": "路由用的 model 从哪取。缺省表示该端点不按 model 路由。",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Locator"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "protocol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "route": {
+          "$ref": "#/$defs/RouteDef"
+        },
+        "shape": {
+          "$ref": "#/$defs/EndpointShape"
+        },
+        "stream_flag": {
+          "description": "客户端要求流式的标志位在哪。缺省表示该端点无流式开关。",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Locator"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageDef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "shape",
+        "route"
+      ]
+    },
+    "EndpointShape": {
+      "description": "端点形态。五个维度正交，是**有限集合**，由 `core` 建模；\n端点身份是开放集合，由描述文件表达。",
+      "type": "object",
+      "properties": {
+        "billing": {
+          "$ref": "#/$defs/BillingTiming"
+        },
+        "handle": {
+          "$ref": "#/$defs/HandleRole"
+        },
+        "request": {
+          "$ref": "#/$defs/RequestForm"
+        },
+        "response": {
+          "$ref": "#/$defs/ResponseForm"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy"
+        }
+      },
+      "required": [
+        "request",
+        "response",
+        "handle",
+        "billing",
+        "retry"
+      ]
+    },
+    "HandleFieldDef": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/Locator"
+        },
+        "kind": {
+          "$ref": "#/$defs/HandleKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "at",
+        "kind"
+      ]
+    },
+    "HandleKind": {
+      "type": "string",
+      "enum": [
+        "task",
+        "file",
+        "batch",
+        "asset",
+        "cache",
+        "response",
+        "session"
+      ]
+    },
+    "HandleRole": {
+      "description": "端点与虚拟句柄的关系。",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "issues": {
+              "$ref": "#/$defs/HandleKind"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "issues"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "consumes": {
+              "$ref": "#/$defs/HandleKind"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "consumes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "terminates": {
+              "$ref": "#/$defs/HandleKind"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "terminates"
+          ]
+        }
+      ]
+    },
+    "HandlesDef": {
+      "description": "`shape.handle` 是粗粒度维度（推导渠道亲和与 Hold 挂载）；\n这里是细粒度字段映射（响应里哪几个串要重写）。两者不重复。",
+      "type": "object",
+      "properties": {
+        "consume": {
+          "description": "请求里引用的句柄，需换回上游 ID。位置可在路径参数或请求体任意处。",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HandleFieldDef"
+          }
+        },
+        "issue": {
+          "description": "本端点签发的句柄。一个响应可签发多个、各自不同类型。",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HandleFieldDef"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "HeaderInject": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "template": {
+          "description": "值模板，`{credential}` 为占位符",
+          "type": "string",
+          "default": "Bearer {credential}"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "InjectDef": {
+      "description": "凭证怎么用。",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "header": {
+              "$ref": "#/$defs/HeaderInject"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "header"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "query": {
+              "$ref": "#/$defs/QueryInject"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "query"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sign": {
+              "$ref": "#/$defs/SignDef"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "sign"
+          ]
+        }
+      ]
+    },
+    "JsonPath": {
+      "description": "RFC 9535 JSONPath，如 $.usage.prompt_tokens",
+      "type": "string",
+      "pattern": "^\\$"
+    },
+    "Locator": {
+      "description": "取值位置：$.<jsonpath> | path.<参数名> | header.<头名>",
+      "type": "string",
+      "pattern": "^(\\$|path\\.|header\\.)"
+    },
+    "Method": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE"
+      ]
+    },
+    "Oauth2Def": {
+      "type": "object",
+      "properties": {
+        "cache_ttl_secs": {
+          "description": "换取到的 token 的缓存时长，秒",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "scope": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "token_url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "token_url",
+        "cache_ttl_secs"
+      ]
+    },
+    "ProtocolKind": {
+      "description": "规范协议。`Native` 用于客户端直接使用厂商私有协议的情形——\n这是透传优先架构的常态，不是例外。",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "openai_chat",
+            "openai_responses",
+            "anthropic_messages",
+            "gemini_generate_content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "native": {
+              "$ref": "#/$defs/ProviderId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "native"
+          ]
+        }
+      ]
+    },
+    "ProviderId": {
+      "description": "Provider 是开放集合，以名称标识。",
+      "type": "string"
+    },
+    "QueryInject": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "template": {
+          "type": "string",
+          "default": "{credential}"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "RequestForm": {
+      "type": "string",
+      "enum": [
+        "none",
+        "json",
+        "multipart",
+        "binary",
+        "json_then_binary"
+      ]
+    },
+    "ResponseForm": {
+      "type": "string",
+      "enum": [
+        "json",
+        "sse",
+        "ndjson",
+        "binary",
+        "duplex"
+      ]
+    },
+    "RetryPolicy": {
+      "type": "string",
+      "enum": [
+        "safe",
+        "idempotent_with_key",
+        "unsafe"
+      ]
+    },
+    "RouteDef": {
+      "description": "入站与上游分离：透传优先下两者多数相同，但资产库类端点必须能分离\n（不同 host、不同路径）。路径模板参数用 `{name}`，两侧同名参数自动传递。",
+      "type": "object",
+      "properties": {
+        "base_url": {
+          "description": "覆盖 provider 默认 `base_url`",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "headers": {
+          "description": "固定注入的上游头，值支持 `{参数名}` 模板",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "inbound": {
+          "type": "string"
+        },
+        "method": {
+          "$ref": "#/$defs/Method"
+        },
+        "query": {
+          "description": "固定注入的上游查询参数",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "upstream": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "inbound",
+        "upstream"
+      ]
+    },
+    "SignAlg": {
+      "description": "签名算法是有限枚举，与 AWS service model 的 `signatureVersion` 同构。",
+      "type": "string",
+      "enum": [
+        "volc_v4",
+        "aws_sig_v4"
+      ]
+    },
+    "SignDef": {
+      "type": "object",
+      "properties": {
+        "alg": {
+          "$ref": "#/$defs/SignAlg"
+        },
+        "region": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "service": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "alg"
+      ]
+    },
+    "TerminalStates": {
+      "type": "object",
+      "properties": {
+        "failed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "succeeded": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "succeeded",
+        "failed"
+      ]
+    },
+    "Tokenizer": {
+      "description": "tokenizer 编码。词表 embed 进二进制，不做运行时下载。\n\n枚举在此，实现在 `meter`——`core` 不引 `tiktoken-rs`。",
+      "type": "string",
+      "enum": [
+        "o200k_base",
+        "cl100k_base"
+      ]
+    },
+    "UsageDef": {
+      "description": "三个时点读的是不同的文档，因此是三组独立规则，而非一组规则加时点标记。",
+      "type": "object",
+      "properties": {
+        "actual": {
+          "description": "读终态响应体（或流式聚合结果），用于 capture",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UsageRuleDef"
+          }
+        },
+        "estimate": {
+          "description": "读请求体，用于 `hold` 的预扣金额",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UsageRuleDef"
+          }
+        },
+        "fallback": {
+          "description": "上游未返回权威 usage 时的第 3 档估算，结果标记为 estimated",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UsageRuleDef"
+          }
+        },
+        "on_submit": {
+          "description": "读提交响应体，用于 `extend` / `capture_partial` 调整",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UsageRuleDef"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "UsageDim": {
+      "description": "用量维度名。",
+      "type": "string"
+    },
+    "UsageRuleDef": {
+      "description": "一次取值。算子按固定顺序求值：read/hook → map → scale，全程取不到值时落到 default。\n固定顺序而非可编排管道——可编排就是表达式语言的另一种写法。",
+      "type": "object",
+      "properties": {
+        "accum": {
+          "$ref": "#/$defs/Accum",
+          "default": "last"
+        },
+        "default": {
+          "default": null
+        },
+        "dim": {
+          "$ref": "#/$defs/UsageDim"
+        },
+        "hook": {
+          "description": "逃生舱：算子表里没有的那个算子。纯函数、无 IO、无状态。",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "map": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "default": null
+        },
+        "read": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scale": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "tokenize": {
+          "description": "文本字段按 tokenizer 计数。路径可命中多个节点，逐个计数求和。",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tokenizer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "dim"
+      ]
+    }
+  }
+}

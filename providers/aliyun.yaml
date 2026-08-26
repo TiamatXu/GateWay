@@ -1,0 +1,64 @@
+# 阿里云百炼。用于验证调研 §3.5：轮询端点与提交端点不共享路径族。
+#
+# 提交是 POST /api/v1/services/{domain}/{task}/{model} 带 X-DashScope-Async 头，
+# 轮询却是全局统一的 GET /api/v1/tasks/{task_id}——所有异步任务共用一个查询端点，
+# 与提交路径没有任何构造关系。因此两者是各自独立声明、显式引用关联的两个端点。
+schema_version: 1
+provider: aliyun
+
+defaults:
+  base_url: https://dashscope.aliyuncs.com
+  auth:
+    credential: static
+    inject:
+      header:
+        name: authorization
+        template: "Bearer {credential}"
+
+endpoints:
+  - id: text2video_submit
+    shape:
+      request: json
+      response: json
+      handle: { issues: task }
+      billing: on_terminal
+      retry: idempotent_with_key
+    route:
+      method: POST
+      inbound:  /aliyun/api/v1/services/aigc/text2video/video-synthesis
+      upstream: /api/v1/services/aigc/text2video/video-synthesis
+      headers:
+        X-DashScope-Async: enable
+    model: "$.model"
+    handles:
+      issue:
+        - { at: "$.output.task_id", kind: task }
+    async:
+      # 显式引用，不靠 HandleKind 隐式匹配——一个 provider 有两个任务族时会静默歧义
+      poll: task_query
+      state: "$.output.task_status"
+      terminal:
+        succeeded: [SUCCEEDED]
+        failed:    [FAILED, CANCELED, UNKNOWN]
+    usage:
+      estimate:
+        - { dim: audio_millis, read: "$.parameters.duration", default: 5, scale: 1000 }
+      actual:
+        - { dim: audio_millis, read: "$.usage.duration", scale: 1000, accum: last }
+        - { dim: images,       read: "$.usage.video_count", accum: last }
+
+  # 全局统一的任务查询端点：所有异步任务族共用，与任何提交路径都没有构造关系
+  - id: task_query
+    shape:
+      request: none
+      response: json
+      handle: { consumes: task }
+      billing: not_billed
+      retry: safe
+    route:
+      method: GET
+      inbound:  /aliyun/api/v1/tasks/{task_id}
+      upstream: /api/v1/tasks/{task_id}
+    handles:
+      consume:
+        - { at: "path.task_id", kind: task }

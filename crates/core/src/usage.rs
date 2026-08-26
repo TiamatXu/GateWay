@@ -3,6 +3,26 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
+/// JSON 值转账单用量。数量一律为整数，浮点数向零截断，非数值与超出 `i64`
+/// 范围的值一律返回 `None`——宁可漏记一个维度，也不能把垃圾数字带进账单。
+///
+/// 放在 `core`：抽取（`meter`）与描述文件求值（`registry`）都要用，
+/// 而这是一条计费正确性规则，两处各写一遍必然漂移。
+#[must_use]
+pub fn as_billable_i64(v: &serde_json::Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    let f = v.as_f64()?.trunc();
+    if f.is_finite() && f >= -(2f64.powi(63)) && f < 2f64.powi(63) {
+        // 上一行已确保落在 i64 范围内
+        #[allow(clippy::cast_possible_truncation)]
+        Some(f as i64)
+    } else {
+        None
+    }
+}
+
 /// 内置用量维度。维度是开放集合，这里只是常用名的常量，不构成穷举。
 pub mod dims {
     pub const INPUT_TOKENS: &str = "input_tokens";
@@ -13,13 +33,45 @@ pub mod dims {
     pub const AUDIO_MILLIS: &str = "audio_millis";
     pub const IMAGES: &str = "images";
     pub const REQUESTS: &str = "requests";
+    /// 客户端声明的输出上限。不是账单维度，是预扣估算的输入——
+    /// 放在这里是为了让它也由描述文件的 `usage.estimate` 规则提供，
+    /// 而不是在数据平面硬取 `max_tokens` 字段。
+    pub const MAX_OUTPUT_TOKENS: &str = "max_output_tokens";
     pub const STORAGE_BYTE_SECONDS: &str = "storage_byte_seconds";
+}
+
+/// 同一维度多次命中时的累积方式。描述文件的 `accum` 算子。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum Accum {
+    /// 上游上报累计值，后值覆盖前值
+    #[default]
+    Last,
+    /// 上游上报增量，逐帧累加
+    Sum,
+}
+
+/// tokenizer 编码。词表 embed 进二进制，不做运行时下载。
+///
+/// 枚举在此，实现在 `meter`——`core` 不引 `tiktoken-rs`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum Tokenizer {
+    O200kBase,
+    Cl100kBase,
 }
 
 /// 用量维度名。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct UsageDim(SmolStr);
+#[cfg_attr(
+    feature = "schema",
+    derive(schemars::JsonSchema),
+    schemars(transparent)
+)]
+pub struct UsageDim(#[cfg_attr(feature = "schema", schemars(with = "String"))] SmolStr);
 
 impl UsageDim {
     #[must_use]

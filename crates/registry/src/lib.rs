@@ -1,34 +1,48 @@
-//! Provider 描述文件的 schema、加载校验与渠道注册表。
+//! Provider 描述文件的 schema、加载校验与端点目录。
 //!
-//! M0 只定义契约：数据平面硬编码单厂商（SIMPLIFIED(M0)）。M2 起读 YAML。
+//! 描述文件是**数据**，不是程序：只能填值和选算子，算子是有限具名集合。
 //! 验收指标是「接入一个全新端点需要编写 0 行 Rust 代码」。
+//!
+//! 设计见 `docs/superpowers/specs/2026-08-26-m2-descriptor-layer-design.md`。
 
-use gw_core::{EndpointShape, ProviderId};
-use smol_str::SmolStr;
+pub mod auth;
+pub mod catalog;
+pub mod compile;
+pub mod error;
+pub mod hook;
+pub mod load;
+pub mod locator;
+pub mod milestone;
+pub mod rule;
+pub mod schema;
+pub mod template;
 
-#[derive(Debug, thiserror::Error)]
-pub enum RegistryError {
-    #[error("描述文件不合 schema: {0}")]
-    Schema(String),
-    #[error("描述文件解析失败: {0}")]
-    Parse(String),
-}
+pub use auth::{AuthError, Injected, inject};
+pub use catalog::{Catalog, EndpointDesc, InboundMatch, InboundRoute, Usage};
+pub use compile::{Deferred, Loaded, compile};
+pub use error::RegistryError;
+pub use hook::{HookError, HookRegistry, OperatorHook};
+pub use load::{Registry, load_dir, parse_file, parse_str};
+pub use locator::{Locator, PathExpr};
+pub use milestone::{IMPLEMENTED, Milestone, Unsupported};
+pub use rule::{Source, UsageRule};
+pub use schema::{Descriptor, Method, SCHEMA_VERSION};
+pub use template::PathTemplate;
 
-/// 一个端点的描述。端点身份是开放集合，由描述文件表达；
-/// 端点形态是有限集合，由 `core` 建模。
-#[derive(Debug, Clone)]
-pub struct EndpointDesc {
-    pub id: SmolStr,
-    pub provider: ProviderId,
-    pub shape: EndpointShape,
-    /// 上游路径模板，可含占位符
-    pub upstream_path: String,
-    /// 用量抽取的 `JSONPath` 规则，维度名 → 路径
-    pub usage_paths: Vec<(SmolStr, SmolStr)>,
-}
-
-pub trait ProviderRegistry: Send + Sync {
-    fn lookup(&self, provider: &ProviderId, path: &str) -> Option<EndpointDesc>;
+/// 端点目录的只读视图。数据平面按此取绑定，不关心目录怎么来的。
+pub trait ProviderCatalog: Send + Sync {
+    /// 按入站方法与路径解析端点。
+    fn resolve(&self, method: Method, path: &str) -> Option<InboundMatch<'_>>;
     /// 配置热更新的版本号，用于快照绑定。
     fn snapshot_version(&self) -> u64;
+}
+
+impl ProviderCatalog for Catalog {
+    fn resolve(&self, method: Method, path: &str) -> Option<InboundMatch<'_>> {
+        Self::resolve(self, method, path)
+    }
+
+    fn snapshot_version(&self) -> u64 {
+        self.version()
+    }
 }

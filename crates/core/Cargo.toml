@@ -8,12 +8,16 @@ publish.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 smol_str = { workspace = true }
 http = { workspace = true }
 uuid = { workspace = true }
+schemars = { workspace = true, optional = true }
+
+[features]
+schema = ["dep:schemars"]
 
 [dev-dependencies]
-serde_json = { workspace = true }
 rstest = { workspace = true }
 
 [lints]

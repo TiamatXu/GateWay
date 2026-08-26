@@ -53,10 +53,26 @@ async fn json_handler() -> Response {
         .into_response()
 }
 
+/// 回显收到的路径与头，用于验证转发行为完全由描述文件决定
+async fn echo_handler(uri: axum::http::Uri, headers: axum::http::HeaderMap) -> Response {
+    let h: serde_json::Map<String, serde_json::Value> = headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_owned(),
+                serde_json::Value::String(v.to_str().unwrap_or_default().to_owned()),
+            )
+        })
+        .collect();
+    axum::Json(serde_json::json!({ "path": uri.path(), "headers": h })).into_response()
+}
+
 async fn spawn_upstream() -> SocketAddr {
     let app = Router::new()
         .route("/v1/chat/completions", post(sse_handler))
-        .route("/v1/nostream", post(json_handler));
+        .route("/v1/embeddings", post(json_handler))
+        // Anthropic 原生端点：入站是 /anthropic/v1/messages，上游是 /v1/messages
+        .route("/v1/messages", post(echo_handler));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -85,6 +101,7 @@ struct Fixture {
     account: i64,
     api_key: String,
     model: String,
+    upstream_base: String,
     _keepalive: mpsc::Receiver<gw_core::HoldId>,
 }
 
@@ -135,12 +152,15 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
         .execute(&pool)
         .await
         .unwrap();
+    // provider 用 openai：端点行为全部来自 providers/openai.yaml，
+    // 渠道的 base_url 把上游指到本地 mock。凭据是裸值，
+    // "Bearer " 前缀由描述文件的注入模板加。
     sqlx::query(
         "INSERT INTO channel (provider, base_url, credential, enabled)
-         VALUES ('mock', $1, $2, true)",
+         VALUES ('openai', $1, $2, true)",
     )
     .bind(format!("http://{upstream_addr}"))
-    .bind(b"Bearer upstream-secret".to_vec())
+    .bind(b"upstream-secret".to_vec())
     .execute(&pool)
     .await
     .unwrap();
@@ -194,6 +214,13 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
         pricing,
         settler: Arc::clone(&settler),
         upstream: Upstream::new(),
+        endpoints: Arc::new(
+            gw_gateway::Endpoints::open(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../providers"),
+                gw_registry::HookRegistry::new(),
+            )
+            .expect("内置描述文件应当可加载"),
+        ),
         config: GatewayConfig::default(),
     });
 
@@ -215,11 +242,26 @@ async fn setup(balance: i64, max_inflight: u32) -> Fixture {
         account,
         api_key,
         model,
+        upstream_base: format!("http://{upstream_addr}"),
         _keepalive: reclaim_rx,
     }
 }
 
 impl Fixture {
+    /// 追加一个渠道。入站路径由描述文件决定走哪个 provider。
+    async fn add_channel(&self, provider: &str, credential: &[u8]) {
+        sqlx::query(
+            "INSERT INTO channel (provider, base_url, credential, enabled)
+             VALUES ($1, $2, $3, true)",
+        )
+        .bind(provider)
+        .bind(&self.upstream_base)
+        .bind(credential.to_vec())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
     /// 在同一 fixture 内再建一把 API Key（各自独立账户）。
     /// 不能再调 setup()——它持有串行锁，重复申请会自锁。
     async fn add_api_key(&self, balance: i64) -> String {
@@ -321,13 +363,16 @@ async fn bills_a_streaming_request_end_to_end() {
 async fn bills_a_non_streaming_request() {
     let fx = setup(START_BALANCE, 64).await;
 
-    let resp = fx.request("/v1/nostream", false).send().await.unwrap();
+    // embeddings 是描述文件里声明的非流式端点（response: json）
+    let resp = fx.request("/v1/embeddings", false).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     resp.text().await.unwrap();
 
+    // 上游同时返回了 prompt_tokens 10 与 completion_tokens 5，但 embeddings 端点
+    // 的描述文件只声明了 input_tokens 一个维度——计什么由声明决定，不由响应决定
     let (balance, held) = fx.settled().await;
     assert_eq!(held, 0);
-    assert_eq!(balance, START_BALANCE - 15);
+    assert_eq!(balance, START_BALANCE - 10);
 }
 
 /// 账单落库，且密钥类头绝不出现在日志中
@@ -663,4 +708,48 @@ async fn readyz_ignores_transient_overload() {
     }
     let resp = reqwest::get(format!("{}/readyz", fx.base)).await.unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+/// 主干零厂商分支：同一份代码，两个 provider 的鉴权方式、上游路径与协议
+/// 全部只由各自的描述文件决定。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn descriptors_alone_decide_auth_and_path_rewriting() {
+    let fx = setup(START_BALANCE, 64).await;
+    fx.add_channel("anthropic", b"sk-ant-secret").await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/anthropic/v1/messages", fx.base))
+        .bearer_auth(&fx.api_key)
+        .json(&serde_json::json!({
+            "model": fx.model,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let echoed: serde_json::Value = resp.json().await.unwrap();
+
+    // 上游路径由 route.upstream 重写，与入站路径不同
+    assert_eq!(echoed["path"], "/v1/messages");
+
+    // 凭据注入到 x-api-key 且是裸值——描述文件里写的模板是 "{credential}"，
+    // 不是 openai 那套 "Bearer {credential}"
+    assert_eq!(echoed["headers"]["x-api-key"], "sk-ant-secret");
+    assert!(
+        echoed["headers"].get("authorization").is_none(),
+        "客户端凭据不得透传给上游"
+    );
+
+    // route.headers 里声明的固定头也注入了
+    assert_eq!(echoed["headers"]["anthropic-version"], "2023-06-01");
+
+    // 回显响应里没有 usage，本次不产生费用，但冻结必须释放
+    for _ in 0..100 {
+        if fx.balances().await.1 == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    panic!("冻结未释放：{:?}", fx.balances().await);
 }

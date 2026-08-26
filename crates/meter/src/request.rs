@@ -5,7 +5,8 @@
 
 use serde_json_path::{JsonPath, ParseError};
 
-use crate::Tokenizer;
+use crate::usage::count_tokens;
+use gw_core::Tokenizer;
 
 /// 从请求体中取文本的路径集合。
 #[derive(Debug)]
@@ -43,7 +44,7 @@ impl TextSpec {
                 if let Some(text) = node.as_str() {
                     found = true;
                     tokens = tokens.saturating_add(
-                        i64::try_from(self.tokenizer.count(text)).unwrap_or(i64::MAX),
+                        i64::try_from(count_tokens(self.tokenizer, text)).unwrap_or(i64::MAX),
                     );
                 }
             }
@@ -74,7 +75,7 @@ impl RequestTokenCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Tokenizer;
+    use gw_core::Tokenizer;
 
     fn openai() -> TextSpec {
         TextSpec::new(Tokenizer::O200kBase)

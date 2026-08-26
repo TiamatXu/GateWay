@@ -1,55 +1,28 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use gw_core::{UsageDim, UsageExtractor, UsageVector};
-use serde_json_path::{JsonPath, ParseError};
+use gw_core::{Accum, Tokenizer, UsageDim, UsageExtractor, UsageVector};
+use gw_registry::{PathExpr, Source, UsageRule};
 
 use crate::SseParser;
 
-/// 同一维度多次命中时的累积方式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Accum {
-    /// 上游上报累计值，后值覆盖前值
-    Last,
-    /// 上游上报增量，逐帧累加
-    Sum,
+/// `Tokenizer` 枚举定义在 `core`（描述文件要用），实现留在这里——`core` 不引 `tiktoken-rs`。
+pub(crate) fn count_tokens(tokenizer: Tokenizer, text: &str) -> usize {
+    let bpe = match tokenizer {
+        Tokenizer::O200kBase => tiktoken_rs::o200k_base_singleton(),
+        Tokenizer::Cl100kBase => tiktoken_rs::cl100k_base_singleton(),
+    };
+    bpe.encode_ordinary(text).len()
 }
 
-#[derive(Debug)]
-struct UsageRule {
-    dim: UsageDim,
-    path: JsonPath,
-    accum: Accum,
-}
-
-/// tokenizer 编码。词表 embed 进二进制，不做运行时下载。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tokenizer {
-    O200kBase,
-    Cl100kBase,
-}
-
-impl Tokenizer {
-    pub(crate) fn count(self, text: &str) -> usize {
-        let bpe = match self {
-            Self::O200kBase => tiktoken_rs::o200k_base_singleton(),
-            Self::Cl100kBase => tiktoken_rs::cl100k_base_singleton(),
-        };
-        bpe.encode_ordinary(text).len()
-    }
-}
-
-#[derive(Debug)]
-struct TextFallback {
-    dim: UsageDim,
-    path: JsonPath,
-    tokenizer: Tokenizer,
-}
-
-/// 用量抽取规则集。最终形态由 Provider 描述文件提供，M0 在代码中构造。
+/// 用量抽取规则集。规则来自 Provider 描述文件（`registry` 编译产物），
+/// 这里只负责把它们作用到响应文档上——`registry` 出数据，`meter` 出行为。
 #[derive(Debug, Default)]
 pub struct UsageSpec {
+    /// 直接求值的规则
     rules: Vec<UsageRule>,
-    fallback: Option<TextFallback>,
+    /// 按文本计 token 的兜底规则，仅在对应维度没有权威值时生效
+    fallbacks: Vec<UsageRule>,
 }
 
 impl UsageSpec {
@@ -58,6 +31,19 @@ impl UsageSpec {
         Self::default()
     }
 
+    /// 从描述文件编译出的规则构造。`estimate` / `actual` 各自成一份 spec——
+    /// 它们读的是不同的文档。
+    #[must_use]
+    pub fn from_rules(rules: &[UsageRule]) -> Self {
+        let (fallbacks, rules) = rules
+            .iter()
+            .cloned()
+            .partition::<Vec<_>, _>(UsageRule::is_tokenized);
+        Self { rules, fallbacks }
+    }
+
+    /// 描述文件之外手工构造一条读取规则。测试与内置兜底用。
+    ///
     /// # Errors
     /// `path` 不是合法的 RFC 9535 `JSONPath` 时返回错误。
     pub fn rule(
@@ -65,11 +51,15 @@ impl UsageSpec {
         dim: impl Into<UsageDim>,
         path: &str,
         accum: Accum,
-    ) -> Result<Self, ParseError> {
+    ) -> Result<Self, String> {
         self.rules.push(UsageRule {
             dim: dim.into(),
-            path: JsonPath::parse(path)?,
+            source: Source::Read(PathExpr::parse(path)?),
+            map: None,
+            scale: None,
+            default: None,
             accum,
+            tokenize: None,
         });
         Ok(self)
     }
@@ -83,55 +73,75 @@ impl UsageSpec {
         dim: impl Into<UsageDim>,
         path: &str,
         tokenizer: Tokenizer,
-    ) -> Result<Self, ParseError> {
-        self.fallback = Some(TextFallback {
+    ) -> Result<Self, String> {
+        self.fallbacks.push(UsageRule {
             dim: dim.into(),
-            path: JsonPath::parse(path)?,
-            tokenizer,
+            source: Source::Read(PathExpr::parse(path)?),
+            map: None,
+            scale: None,
+            default: None,
+            accum: Accum::Sum,
+            tokenize: Some(tokenizer),
         });
         Ok(self)
     }
 
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty() && self.fallbacks.is_empty()
+    }
+
+    /// 一次性文档（请求体、非流式响应体）的求值。
+    #[must_use]
+    pub fn evaluate(&self, doc: &serde_json::Value) -> UsageVector {
+        let mut out = UsageVector::new();
+        self.apply(doc, &mut out);
+        let mut tokens = BTreeMap::new();
+        self.accumulate_fallback(doc, &mut tokens);
+        for (dim, n) in tokens {
+            if out.get(dim.as_str()) == 0 {
+                out.set(dim, n);
+            }
+        }
+        out
+    }
+
     /// 逐帧累加：全量缓存生成文本会突破每流内存预算。分帧编码在边界处
     /// 略有偏差，但结果本就标记为估算值。
-    fn accumulate_fallback(&self, doc: &serde_json::Value, tokens: &mut i64) {
-        let Some(fb) = &self.fallback else { return };
-        for node in fb.path.query(doc).all() {
-            if let Some(text) = node.as_str()
-                && !text.is_empty()
-            {
-                *tokens += i64::try_from(fb.tokenizer.count(text)).unwrap_or(i64::MAX);
+    fn accumulate_fallback(&self, doc: &serde_json::Value, tokens: &mut BTreeMap<UsageDim, i64>) {
+        for fb in &self.fallbacks {
+            let (Some(path), Some(tk)) = (fb.source_path(), fb.tokenize) else {
+                continue;
+            };
+            let mut n = 0i64;
+            for node in path.compiled().query(doc).all() {
+                if let Some(text) = node.as_str()
+                    && !text.is_empty()
+                {
+                    n += i64::try_from(count_tokens(tk, text)).unwrap_or(i64::MAX);
+                }
+            }
+            if n != 0 {
+                *tokens.entry(fb.dim.clone()).or_insert(0) += n;
             }
         }
     }
 
     fn apply(&self, doc: &serde_json::Value, out: &mut UsageVector) {
         for rule in &self.rules {
-            let Some(v) = rule.path.query(doc).exactly_one().ok() else {
-                continue;
-            };
-            let Some(n) = as_i64(v) else { continue };
+            let Some(n) = rule.eval(doc) else { continue };
             match rule.accum {
                 Accum::Last => out.set(rule.dim.clone(), n),
                 Accum::Sum => out.set(rule.dim.clone(), out.get(rule.dim.as_str()) + n),
             }
         }
     }
-}
 
-/// 数量一律为整数。浮点数向零截断，非数值与超出 i64 范围的值一律忽略——
-/// 宁可漏记一个维度，也不能把垃圾数字带进账单。
-fn as_i64(v: &serde_json::Value) -> Option<i64> {
-    if let Some(n) = v.as_i64() {
-        return Some(n);
-    }
-    let f = v.as_f64()?.trunc();
-    if f.is_finite() && f >= -(2f64.powi(63)) && f < 2f64.powi(63) {
-        // 上一行已确保落在 i64 范围内
-        #[allow(clippy::cast_possible_truncation)]
-        Some(f as i64)
-    } else {
-        None
+    /// 权威 usage 是否已到齐：每个配了兜底的维度都拿到了非零权威值。
+    fn has_authoritative(&self, usage: &UsageVector) -> bool {
+        self.fallbacks
+            .iter()
+            .all(|fb| usage.get(fb.dim.as_str()) != 0)
     }
 }
 
@@ -141,8 +151,8 @@ pub struct SseUsageExtractor {
     parser: SseParser,
     spec: Arc<UsageSpec>,
     usage: UsageVector,
-    /// 兜底估算出的 token 数，仅在权威 usage 缺席时生效
-    fallback_tokens: i64,
+    /// 兜底估算出的 token 数，仅在对应维度的权威 usage 缺席时生效
+    fallback_tokens: BTreeMap<UsageDim, i64>,
 }
 
 impl SseUsageExtractor {
@@ -152,25 +162,21 @@ impl SseUsageExtractor {
             parser: SseParser::new(),
             spec,
             usage: UsageVector::new(),
-            fallback_tokens: 0,
+            fallback_tokens: BTreeMap::new(),
         }
     }
 
-    /// 权威 usage 是否已到达。
+    /// 权威 usage 是否已到齐。
     fn has_authoritative(&self) -> bool {
-        self.spec
-            .fallback
-            .as_ref()
-            .is_none_or(|fb| self.usage.get(fb.dim.as_str()) != 0)
+        self.spec.has_authoritative(&self.usage)
     }
 
     fn resolved(&self) -> UsageVector {
-        if self.has_authoritative() || self.fallback_tokens == 0 {
-            return self.usage.clone();
-        }
         let mut u = self.usage.clone();
-        if let Some(fb) = &self.spec.fallback {
-            u.set(fb.dim.clone(), self.fallback_tokens);
+        for (dim, n) in &self.fallback_tokens {
+            if u.get(dim.as_str()) == 0 {
+                u.set(dim.clone(), *n);
+            }
         }
         u
     }
@@ -198,7 +204,7 @@ impl UsageExtractor for SseUsageExtractor {
     }
 
     fn estimated(&self) -> bool {
-        !self.has_authoritative() && self.fallback_tokens != 0
+        !self.has_authoritative() && !self.fallback_tokens.is_empty()
     }
 }
 
@@ -219,11 +225,9 @@ impl JsonUsageExtractor {
     }
 
     fn parse(&self) -> UsageVector {
-        let mut usage = UsageVector::new();
-        if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&self.buf) {
-            self.spec.apply(&doc, &mut usage);
-        }
-        usage
+        serde_json::from_slice::<serde_json::Value>(&self.buf)
+            .map(|doc| self.spec.evaluate(&doc))
+            .unwrap_or_default()
     }
 }
 

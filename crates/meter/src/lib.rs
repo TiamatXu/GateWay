@@ -6,4 +6,6 @@ pub mod usage;
 
 pub use request::{RequestTokenCounter, TextSpec};
 pub use sse::{SseEvent, SseParser};
-pub use usage::{Accum, JsonUsageExtractor, SseUsageExtractor, Tokenizer, UsageSpec};
+// `Accum` / `Tokenizer` 定义在 `core`，此处再导出方便调用方
+pub use gw_core::{Accum, Tokenizer};
+pub use usage::{JsonUsageExtractor, SseUsageExtractor, UsageSpec};

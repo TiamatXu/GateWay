@@ -19,4 +19,4 @@ pub use shape::{
     BillingTiming, EndpointShape, HandleKind, HandleRole, ProtocolKind, RequestForm, ResponseForm,
     RetryPolicy,
 };
-pub use usage::{UsageDim, UsageVector, dims};
+pub use usage::{Accum, Tokenizer, UsageDim, UsageVector, as_billable_i64, dims};

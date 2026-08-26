@@ -175,7 +175,7 @@ Rust 在本项目的三个具体红利：
 
 **结论**：`proto` 自行定义，将 `async-openai` 用作字段清单的参考而非依赖。
 
-### 4.5 生态风险：YAML 解析库
+### 4.5 生态风险：YAML 解析库（M2 已实测，风险解除）
 
 这是全栈唯一没有老牌稳妥选项的位置，需显式管理：
 
@@ -184,7 +184,7 @@ Rust 在本项目的三个具体红利：
 - `serde_norway` 是维护中的 fork，但**依赖 `unsafe-libyaml`**，与本 workspace `unsafe_code = "forbid"` 的规约精神冲突
 - **`serde-saphyr`** 为当前最优解：现代解析器、serde 集成、无 Value DOM、纯 Rust 内存安全
 
-**缓解措施**：在 M2（Provider 描述层）动工前，先用真实的 Provider 描述文件对 `serde-saphyr` 做一次实测（含 merge key、嵌套枚举、锚点引用等特性）。若不满足，退回 `yaml-rust2`（低层解析器，自行对接 serde）。此项列为已识别技术风险。
+**实测结论**（2026-08-26，M2）：`serde-saphyr` 1.1 四项全过——锚点与引用、merge key、嵌套 externally-tagged 枚举、错误信息带行列且指到出错字段（rustc 风格带列指示）。**采用，不启用 `yaml-rust2` 回退路径**，风险解除。实测代码保留在 `crates/registry/tests/yaml_probe.rs`，升级 YAML 库时重跑。
 
 ### 4.6 用量计量的生态边界与兜底策略
 
@@ -433,6 +433,6 @@ pub enum RetryPolicy   { Safe, IdempotentWithKey, Unsafe }
 以下尚未确定，需在后续 spec 中解决：
 
 1. ~~里程碑拆分方案~~ — **已解决**，见 [里程碑路线图](2026-08-22-milestones-roadmap.md)。结论：纵向骨架优先，M0–M8 共九个里程碑，总估算 32–45 周。
-2. **端点覆盖空白区调研**（M2 前置）。厂商与端点清单不需自行枚举——社区网关已有现成清单，本项目按热门度排优先级逐步接入。真正需要产出的是「主流网关普遍不支持的端点」清单，那份空白清单是产品差异化的靶子。不阻塞 `core` 建模，在 M2（Provider 描述层）动工前完成即可。
+2. ~~端点覆盖空白区调研~~ — **已解决**，见 [M2 前置调研：端点覆盖空白区](2026-08-26-m2-endpoint-coverage-research.md)。结论：`EndpointShape` 五维无需增加维度，空白区的难点在描述文件的其余字段。
 3. ~~多租户模型层级~~ — **已解决**，见 [身份、组织与计费主体模型](2026-08-22-identity-org-billing-model-design.md)。结论：单棵任意深度组织树（ltree），计费主体 `Account` 与层级解耦、可挂任意节点，请求解析为账户链；嵌套额度第一版完整实现。
-4. **hook 机制的具体形态**。引入时机已定为 M2；WASM（`wasmtime`）与内置 Rust hook 的取舍待定——当前倾向内置 Rust hook 优先、`wasmtime` 预留接口。
+4. ~~hook 机制的具体形态~~ — **已解决**，见 [M2：Provider 描述层设计](2026-08-26-m2-descriptor-layer-design.md) §3。结论：hook 定为**纯函数字段级算子**（无 IO、无状态、无上下文），只能出现在槽位级；需要 IO 与缓存的凭证获取（OAuth 换 token、STS）拆为 `CredentialDef` 有限枚举，不走 hook。`wasmtime` **不预留抽象**——逃生舱的形态取决于它要装什么，无真实用例时设计容易错。

@@ -6,8 +6,13 @@ use crate::ProviderId;
 /// 这是透传优先架构的常态，不是例外。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum ProtocolKind {
+    // 显式重命名：snake_case 会把 OpenAi 拆成 open_ai，
+    // 而这个名字是描述文件作者要手写的契约
+    #[serde(rename = "openai_chat")]
     OpenAiChat,
+    #[serde(rename = "openai_responses")]
     OpenAiResponses,
     AnthropicMessages,
     GeminiGenerateContent,
@@ -17,6 +22,7 @@ pub enum ProtocolKind {
 /// 端点形态。五个维度正交，是**有限集合**，由 `core` 建模；
 /// 端点身份是开放集合，由描述文件表达。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EndpointShape {
     pub request: RequestForm,
     pub response: ResponseForm,
@@ -41,6 +47,7 @@ impl EndpointShape {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum RequestForm {
     None,
     Json,
@@ -51,6 +58,7 @@ pub enum RequestForm {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum ResponseForm {
     Json,
     Sse,
@@ -62,6 +70,7 @@ pub enum ResponseForm {
 /// 端点与虚拟句柄的关系。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum HandleRole {
     None,
     Issues(HandleKind),
@@ -78,6 +87,7 @@ impl HandleRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum HandleKind {
     Task,
     File,
@@ -90,6 +100,7 @@ pub enum HandleKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum BillingTiming {
     InRequest,
     OnTerminal,
@@ -100,6 +111,7 @@ pub enum BillingTiming {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum RetryPolicy {
     Safe,
     IdempotentWithKey,

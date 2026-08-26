@@ -37,7 +37,12 @@ uuid_id!(HoldId, HandleId, RequestId);
 /// Provider 是开放集合，以名称标识。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ProviderId(pub SmolStr);
+#[cfg_attr(
+    feature = "schema",
+    derive(schemars::JsonSchema),
+    schemars(transparent)
+)]
+pub struct ProviderId(#[cfg_attr(feature = "schema", schemars(with = "String"))] pub SmolStr);
 
 impl ProviderId {
     #[must_use]

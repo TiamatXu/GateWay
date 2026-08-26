@@ -21,6 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
+      # 描述文件的 JSON Schema 由 Rust 类型生成并提交，二者不一致即失败
+      - run: cargo test -p gw-registry --features schema --test json_schema
 
   test:
     runs-on: ubuntu-latest
