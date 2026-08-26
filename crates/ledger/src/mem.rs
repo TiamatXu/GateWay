@@ -4,17 +4,20 @@
 //! 两者必须通过同一套一致性测试。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use gw_core::{AccountId, HoldId, Money};
+use gw_core::{AccountId, HoldId, Money, RateKey};
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::lock::LockGuard;
 use crate::pg::{AuditMismatch, Coordinator};
+use crate::rate::RateLimiter;
 use crate::{Hold, HoldRequest, LedgerError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +34,7 @@ struct HoldRow {
     /// 每级账户当前仍冻结的金额
     legs: Vec<(AccountId, i64)>,
     expires_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Default)]
@@ -50,6 +54,9 @@ pub struct MemCoordinator {
     state: Mutex<State>,
     reclaimer: mpsc::Sender<HoldId>,
     next_account: AtomicI64,
+    rate: RateLimiter,
+    /// 锁名 → 过期时刻。`Arc` 是为了让 `LockGuard` 析构时能回来摘除自己。
+    locks: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
 }
 
 impl MemCoordinator {
@@ -59,6 +66,8 @@ impl MemCoordinator {
             state: Mutex::new(State::default()),
             reclaimer,
             next_account: AtomicI64::new(1),
+            rate: RateLimiter::default(),
+            locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -170,6 +179,7 @@ impl Coordinator for MemCoordinator {
                 status: Status::Active,
                 legs,
                 expires_at,
+                created_at: Utc::now(),
             },
         );
         state.by_key.insert(req.idempotency_key.to_owned(), id);
@@ -288,6 +298,9 @@ impl Coordinator for MemCoordinator {
         for id in expired {
             Self::settle_locked(&mut state, id, Status::Expired, 0)?;
         }
+        if n > 0 {
+            metrics::counter!("ledger.expired_holds_reclaimed").increment(n);
+        }
         Ok(n)
     }
 
@@ -315,6 +328,65 @@ impl Coordinator for MemCoordinator {
             })
             .take(usize::try_from(limit).unwrap_or(usize::MAX))
             .collect())
+    }
+
+    async fn hold_stats(&self) -> Result<crate::pg::HoldStats, LedgerError> {
+        let now = Utc::now();
+        let state = self.lock();
+        let mut ages: Vec<i64> = state
+            .holds
+            .values()
+            .filter(|r| r.status == Status::Active)
+            .map(|r| (now - r.created_at).num_milliseconds().max(0))
+            .collect();
+        ages.sort_unstable();
+
+        // 与 PG 的 percentile_disc 一致：取实际存在的样本，不做插值
+        let age_p99 = if ages.is_empty() {
+            Duration::ZERO
+        } else {
+            #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = (((ages.len() - 1) as f64) * 0.99).ceil() as usize;
+            Duration::from_millis(u64::try_from(ages[idx.min(ages.len() - 1)]).unwrap_or(0))
+        };
+
+        Ok(crate::pg::HoldStats {
+            active: i64::try_from(ages.len()).unwrap_or(i64::MAX),
+            age_p99,
+        })
+    }
+
+    async fn rate_allow(
+        &self,
+        key: &RateKey,
+        rate: u32,
+        burst: u32,
+    ) -> Result<bool, LedgerError> {
+        Ok(self.rate.allow(key, rate, burst))
+    }
+
+    async fn try_lock(
+        &self,
+        key: &str,
+        ttl: Duration,
+    ) -> Result<Option<LockGuard>, LedgerError> {
+        let now = Utc::now();
+        let mut held = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // 已过期的持有等同于无人持有——持有者崩溃时 LockGuard 的析构不会跑到
+        if held.get(key).is_some_and(|expires| *expires > now) {
+            return Ok(None);
+        }
+        let expires_at = now
+            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::hours(1));
+        held.insert(key.to_owned(), expires_at);
+        drop(held);
+
+        Ok(Some(LockGuard::mem(key, Arc::clone(&self.locks))))
     }
 
     async fn balances(&self, account: AccountId) -> Result<(Money, Money), LedgerError> {

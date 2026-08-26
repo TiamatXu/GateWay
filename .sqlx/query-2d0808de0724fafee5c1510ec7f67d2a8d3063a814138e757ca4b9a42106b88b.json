@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"active!\",\n                      COALESCE(\n                        percentile_disc(0.99) WITHIN GROUP (\n                          ORDER BY EXTRACT(EPOCH FROM (now() - created_at))\n                        ), 0)::DOUBLE PRECISION AS \"age_p99!\"\n                 FROM hold WHERE status = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "active!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "age_p99!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int2"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "2d0808de0724fafee5c1510ec7f67d2a8d3063a814138e757ca4b9a42106b88b"
+}

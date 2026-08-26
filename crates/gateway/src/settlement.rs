@@ -272,6 +272,27 @@ mod tests {
         async fn audit(&self, _limit: i64) -> Result<Vec<gw_ledger::AuditMismatch>, LedgerError> {
             Ok(vec![])
         }
+        async fn hold_stats(&self) -> Result<gw_ledger::HoldStats, LedgerError> {
+            Ok(gw_ledger::HoldStats {
+                active: 0,
+                age_p99: std::time::Duration::ZERO,
+            })
+        }
+        async fn rate_allow(
+            &self,
+            _key: &gw_core::RateKey,
+            _rate: u32,
+            _burst: u32,
+        ) -> Result<bool, LedgerError> {
+            Ok(true)
+        }
+        async fn try_lock(
+            &self,
+            _key: &str,
+            _ttl: std::time::Duration,
+        ) -> Result<Option<gw_ledger::LockGuard>, LedgerError> {
+            unimplemented!("结算路径不取分布式锁")
+        }
     }
 
     /// 按 `output_tokens` × 2 纳单位计价

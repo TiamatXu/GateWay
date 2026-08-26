@@ -1,11 +1,15 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::Utc;
-use gw_core::{AccountId, BillingTiming, HoldId, Money};
+use gw_core::{AccountId, BillingTiming, HoldId, Money, RateKey};
 use smallvec::SmallVec;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::lock::{LockGuard, advisory_key};
+use crate::rate::RateLimiter;
 use crate::{Hold, HoldRequest, LedgerError};
 
 // hold.status
@@ -47,6 +51,32 @@ pub trait Coordinator: Send + Sync {
     /// 对账：返回 `held` 与活跃 Hold 腿之和不一致的账户。
     /// 这是防死冻结的第七道防线——不一致即告警。
     async fn audit(&self, limit: i64) -> Result<Vec<AuditMismatch>, LedgerError>;
+
+    /// 活跃 Hold 的数量与年龄分布。第七道防线的可观测部分。
+    async fn hold_stats(&self) -> Result<HoldStats, LedgerError>;
+
+    /// 取一个令牌。`rate` 为每秒补充数，`burst` 为桶容量，任一为 0 即不限流。
+    async fn rate_allow(&self, key: &RateKey, rate: u32, burst: u32)
+    -> Result<bool, LedgerError>;
+
+    /// 尝试取得分布式互斥，`None` 表示已被他人持有。释放靠 `LockGuard` 析构。
+    ///
+    /// `ttl` 是兜底释放时限，防止持有者崩溃后锁永久滞留。`pg` 实现用
+    /// `pg_try_advisory_lock`，锁随连接生命周期释放——比 TTL 更及时，
+    /// 故忽略该参数。
+    async fn try_lock(
+        &self,
+        key: &str,
+        ttl: Duration,
+    ) -> Result<Option<LockGuard>, LedgerError>;
+}
+
+/// 活跃 Hold 的概览。年龄持续走高意味着有 Hold 迟迟不结算，是死冻结的前兆。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldStats {
+    pub active: i64,
+    /// 最老的 1% 活跃 Hold 已存在多久
+    pub age_p99: Duration,
 }
 
 /// 一处账实不符。
@@ -62,12 +92,17 @@ pub struct AuditMismatch {
 pub struct PgCoordinator {
     pool: PgPool,
     reclaimer: mpsc::Sender<HoldId>,
+    rate: RateLimiter,
 }
 
 impl PgCoordinator {
     #[must_use]
     pub fn new(pool: PgPool, reclaimer: mpsc::Sender<HoldId>) -> Self {
-        Self { pool, reclaimer }
+        Self {
+            pool,
+            reclaimer,
+            rate: RateLimiter::default(),
+        }
     }
 
     async fn do_reclaim_expired(&self, limit: i64) -> Result<u64, LedgerError> {
@@ -93,6 +128,9 @@ impl PgCoordinator {
             release_legs(&mut tx, id, 0, ENTRY_EXPIRE).await?;
             tx.commit().await?;
             n += 1;
+        }
+        if n > 0 {
+            metrics::counter!("ledger.expired_holds_reclaimed").increment(n);
         }
         Ok(n)
     }
@@ -258,6 +296,56 @@ impl Coordinator for PgCoordinator {
                 active_legs: Money::from_nanos(r.active_legs),
             })
             .collect())
+    }
+
+    async fn hold_stats(&self) -> Result<HoldStats, LedgerError> {
+        let row = sqlx::query!(
+            r#"SELECT count(*) AS "active!",
+                      COALESCE(
+                        percentile_disc(0.99) WITHIN GROUP (
+                          ORDER BY EXTRACT(EPOCH FROM (now() - created_at))
+                        ), 0)::DOUBLE PRECISION AS "age_p99!"
+                 FROM hold WHERE status = $1"#,
+            ACTIVE
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(HoldStats {
+            active: row.active,
+            age_p99: Duration::from_secs_f64(row.age_p99.max(0.0)),
+        })
+    }
+
+    async fn rate_allow(
+        &self,
+        key: &RateKey,
+        rate: u32,
+        burst: u32,
+    ) -> Result<bool, LedgerError> {
+        Ok(self.rate.allow(key, rate, burst))
+    }
+
+    async fn try_lock(
+        &self,
+        key: &str,
+        _ttl: Duration,
+    ) -> Result<Option<LockGuard>, LedgerError> {
+        let mut conn = self.pool.acquire().await?;
+        let got = sqlx::query_scalar!(
+            r#"SELECT pg_try_advisory_lock($1) AS "got!""#,
+            advisory_key(key)
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+
+        if !got {
+            // 未持锁，连接照常归还池中
+            return Ok(None);
+        }
+        // advisory lock 绑在会话上，连接一旦回到池里就可能被别的查询复用并
+        // 在归还时连带释放。摘出连接由 LockGuard 独占，析构才关闭。
+        Ok(Some(LockGuard::pg(key, conn.detach())))
     }
 
     async fn balances(&self, account: AccountId) -> Result<(Money, Money), LedgerError> {

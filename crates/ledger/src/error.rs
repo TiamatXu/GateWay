@@ -14,6 +14,8 @@ pub enum LedgerError {
     DuplicateRequest { key: String },
     #[error("账户链为空")]
     EmptyChain,
+    #[error("{timing:?} 不是滚动计费，不能开滚动 Hold")]
+    TimingNotRolling { timing: gw_core::BillingTiming },
     #[error("数据库错误: {0}")]
     Db(#[from] sqlx::Error),
 }

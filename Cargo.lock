@@ -675,6 +675,7 @@ dependencies = [
  "gw-pricing",
  "gw-proxy",
  "gw-store",
+ "metrics",
  "tokio",
  "tracing",
 ]
@@ -755,6 +756,7 @@ dependencies = [
  "gw-store",
  "metrics",
  "proptest",
+ "sha2",
  "smallvec",
  "sqlx",
  "thiserror",

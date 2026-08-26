@@ -21,11 +21,13 @@ smallvec = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 gw-store = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 proptest = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

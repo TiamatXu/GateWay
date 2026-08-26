@@ -144,13 +144,26 @@ fn spawn_load_sampler(
     })
 }
 
+/// 过期扫描的互斥锁名。多节点部署时只有持锁者扫描。
+const RECLAIM_LOCK: &str = "ledger.reclaim_expired";
+
 /// 兜底回收：既消费泄漏上报，也定期扫描过期 Hold。
+///
+/// 泄漏上报是本节点自己的 Hold，各节点各管各的，不需要互斥。
+/// 过期扫描是全库范围的，多节点同时扫会重复处理同一批行——虽然
+/// `FOR UPDATE SKIP LOCKED` 保证了正确性，但白白浪费连接与事务，
+/// 因此用 advisory lock 收敛到单实例。
+///
+/// 锁一直持有到进程退出。持锁者崩溃时连接随之关闭，PostgreSQL 立即释放，
+/// 其余节点在下一个 tick 接手——这就是故障转移，不需要额外的选举逻辑。
 fn spawn_reclaimer(
     coord: Arc<dyn Coordinator>,
     mut leaked: mpsc::Receiver<gw_core::HoldId>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        let mut scanner: Option<gw_ledger::LockGuard> = None;
+
         loop {
             tokio::select! {
                 Some(id) = leaked.recv() => {
@@ -159,10 +172,35 @@ fn spawn_reclaimer(
                     }
                 }
                 _ = ticker.tick() => {
+                    if scanner.is_none() {
+                        match coord.try_lock(RECLAIM_LOCK, Duration::from_secs(300)).await {
+                            Ok(Some(guard)) => {
+                                tracing::info!("已接管过期 Hold 扫描");
+                                scanner = Some(guard);
+                            }
+                            Ok(None) => continue, // 他人在扫，本节点这一轮跳过
+                            Err(e) => {
+                                tracing::warn!(error = %e, "取回收锁失败");
+                                continue;
+                            }
+                        }
+                    }
                     match coord.reclaim_expired(500).await {
                         Ok(n) if n > 0 => tracing::info!(count = n, "回收过期 Hold"),
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "扫描过期 Hold 失败"),
+                    }
+                    // 全库范围的量，由持锁者独家上报，避免多节点重复计数
+                    match coord.hold_stats().await {
+                        Ok(stats) => {
+                            // 活跃 Hold 数远达不到 f64 尾数上限，精度损失不存在
+                            #[allow(clippy::cast_precision_loss)]
+                            let active = stats.active as f64;
+                            metrics::gauge!("ledger.active_holds").set(active);
+                            metrics::gauge!("ledger.hold_age_p99_seconds")
+                                .set(stats.age_p99.as_secs_f64());
+                        }
+                        Err(e) => tracing::warn!(error = %e, "采集 Hold 指标失败"),
                     }
                 }
             }

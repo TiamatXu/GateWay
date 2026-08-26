@@ -92,7 +92,24 @@ conformance_tests!(
     reclaiming_a_settled_hold_is_a_no_op,
     capture_partial_beyond_the_reservation_keeps_held_non_negative,
     audit_stays_clean_through_a_lifecycle,
+    rate_allow_spends_the_burst_then_denies,
+    rate_allow_is_unlimited_when_unconfigured,
+    rate_allow_keeps_keys_independent,
+    lock_is_exclusive_while_held,
+    lock_is_reacquirable_after_release,
+    different_lock_keys_do_not_conflict,
+    rolling_rejects_non_rolling_timings,
+    rolling_charges_incrementally_without_closing,
+    rolling_tops_up_when_the_reservation_runs_low,
+    rolling_stops_before_charging_when_funds_run_out,
+    rolling_abandon_keeps_earlier_charges,
+    rolling_charges_every_level_of_the_chain,
 );
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_operations_preserve_invariants() {
+    conformance::concurrent_operations_preserve_invariants(&backend().await).await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_holds_never_overdraw() {
@@ -197,4 +214,25 @@ async fn settled_hold_does_not_report_a_leak() {
         b.leaked.lock().await.try_recv().is_err(),
         "已结算的 Hold 不应上报泄漏"
     );
+}
+
+proptest::proptest! {
+    // 每个用例要建 3 个账户并跑一串真实事务，用例数压低以控制耗时。
+    // 覆盖广度由 mem 版承担，这里压的是 SQL 实现本身。
+    #![proptest_config(proptest::test_runner::Config::with_cases(8))]
+
+    #[test]
+    fn ledger_invariants_hold_after_any_operation_sequence(
+        ops in proptest::collection::vec(conformance::op_strategy(), 0..24)
+    ) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = rt.block_on(async {
+            conformance::check_invariants(&backend().await, &ops).await
+        });
+        proptest::prop_assert!(outcome.is_ok(), "{}", outcome.unwrap_err());
+    }
 }

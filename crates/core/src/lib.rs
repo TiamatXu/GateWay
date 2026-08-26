@@ -9,7 +9,9 @@ pub mod shape;
 pub mod usage;
 
 pub use extract::UsageExtractor;
-pub use ids::{AccountId, ApiKeyId, ChannelId, HandleId, HoldId, NodeId, ProviderId, RequestId};
+pub use ids::{
+    AccountId, ApiKeyId, ChannelId, HandleId, HoldId, NodeId, ProviderId, RateKey, RequestId,
+};
 pub use inbound::InboundRequest;
 pub use money::Money;
 pub use redact::HeaderRedactor;

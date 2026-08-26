@@ -5,10 +5,15 @@
 
 pub mod error;
 pub mod hold;
+pub mod lock;
 pub mod mem;
 pub mod pg;
+mod rate;
+pub mod rolling;
 
 pub use error::LedgerError;
 pub use hold::{Hold, HoldRequest};
+pub use lock::LockGuard;
 pub use mem::MemCoordinator;
-pub use pg::{AuditMismatch, Coordinator, PgCoordinator};
+pub use pg::{AuditMismatch, Coordinator, HoldStats, PgCoordinator};
+pub use rolling::{RollingHold, RollingPolicy};

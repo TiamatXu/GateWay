@@ -78,7 +78,7 @@
 
 ---
 
-### M1 — 账本完整（3–4 周）
+### M1 — 账本完整（3–4 周）✅ 已完成（2026-08-26）
 
 **目标**：把账本做到生产可信。这是全项目风险最高的模块。
 
@@ -104,6 +104,36 @@
 3. 混沌测试：进程在 Hold 与 Capture 之间被强杀，回收器能完整释放，无余额泄漏
 
 **风险**：这是全项目最容易写出隐蔽 bug 的模块。压力测试与 `proptest` 若发现不变量破坏，优先修实现而非放宽断言。
+
+**完成情况**（2026-08-26）
+
+三条验收标准全部通过，286 个测试全绿，clippy `-D warnings -W pedantic` 干净。
+
+| 交付 | 落点 |
+|---|---|
+| 回收器单实例化 | `crates/bin/src/main.rs` 的 `spawn_reclaimer`，锁名 `ledger.reclaim_expired` |
+| `try_lock` | `crates/ledger/src/lock.rs`；`pg` 用 `pg_try_advisory_lock`，`LockGuard` 独占一条摘出的连接 |
+| `rate_allow` | `crates/ledger/src/rate.rs` 令牌桶，两实现共用 |
+| `Session` / `Metered` 语义 | `crates/ledger/src/rolling.rs` 的 `RollingHold` |
+| 高并发压测 | `conformance::concurrent_operations_preserve_invariants`，24 任务 × 16 操作 |
+| 不变量 `proptest` 双实现 | `conformance::check_invariants`，`mem` 96 例 / `pg` 8 例 |
+| 混沌测试 | `crates/ledger/tests/chaos.rs` + `src/bin/crash_probe.rs` |
+| 指标 | `ledger.active_holds`、`ledger.hold_age_p99_seconds`、`ledger.expired_holds_reclaimed` |
+
+二进制冒烟（双节点）已验证互斥与故障转移：节点 A 启动后接管扫描，节点 B 全程
+不接管；SIGKILL 节点 A 后，节点 B 在下一个 tick 内接管；SIGTERM 优雅退出。
+
+实施中相对本文档的偏离：
+
+| 偏离 | 原因 |
+|---|---|
+| `try_lock` 的 `ttl` 参数被 `pg` 实现忽略 | advisory lock 随连接释放，比 TTL 更及时；`mem` 实现按 TTL 生效 |
+| `Coordinator` 新增 `hold_stats` | 指标要的活跃数与年龄分位数是库侧聚合，没有它就得让调用方自己写 SQL |
+| `RateLimiter` 状态在进程内 | 已标 `SIMPLIFIED(M1)`，跨节点聚合随共享存储一起推迟 |
+| `LedgerError` 新增 `TimingNotRolling` | 非滚动 timing 开滚动 Hold 会让 `close` 的语义含糊，在入口挡掉 |
+
+**未做的 M1 项**：`AdmissionGate::check` 的限流参数未接。`rate_allow` 已具备，
+但按 Key 限流需要先有 API Key 的限流配置来源——那是 M8 的身份模型，届时一并接入。
 
 ---
 
