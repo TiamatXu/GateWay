@@ -102,6 +102,32 @@ async fn task_query_handler(axum::extract::Path(task_id): axum::extract::Path<St
     .into_response()
 }
 
+/// 火山引擎 `OpenAPI` 风格的签名端点：把收到的签名头原样回显，
+/// 并自己算一遍体摘要——网关签的必须是真正发出去的那份体。
+async fn signed_handler(headers: axum::http::HeaderMap, body: bytes::Bytes) -> Response {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(&body);
+    let payload = digest.iter().fold(String::new(), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    });
+    let get = |n: &str| {
+        headers
+            .get(n)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    axum::Json(serde_json::json!({
+        "authorization": get("authorization"),
+        "x_date": get("x-date"),
+        "x_content_sha256": get("x-content-sha256"),
+        "body_sha256": payload,
+    }))
+    .into_response()
+}
+
 async fn spawn_upstream() -> SocketAddr {
     let app = Router::new()
         .route("/v1/chat/completions", post(sse_handler))
@@ -115,7 +141,9 @@ async fn spawn_upstream() -> SocketAddr {
         .route(
             "/api/v1/tasks/{task_id}",
             axum::routing::get(task_query_handler),
-        );
+        )
+        // 火山引擎资产库走 OpenAPI 根路径，动作由查询参数区分
+        .route("/", post(signed_handler));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1003,4 +1031,106 @@ async fn the_sweeper_settles_tasks_nobody_polls() {
     let (balance, held) = fx.settled().await;
     assert_eq!(held, 0);
     assert_eq!(balance, START_BALANCE - 5_000);
+}
+
+/// AK/SK 请求签名：签名头要真的到上游，且签的必须是实际发出去的那份体。
+///
+/// 算法本身由 `registry` 的已知答案测试钉死（AWS 官方 get-vanilla 向量 +
+/// 火山引擎 V4 的独立实现向量），这里验的是**上下文有没有正确送进签名器**。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aksk_signing_reaches_the_upstream() {
+    let fx = setup(START_BALANCE, 64).await;
+    fx.add_channel("volcengine", b"AKLTtest:c2VjcmV0").await;
+
+    // 资产句柄由 asset_upload 签发，而那个端点还缺 json_then_binary；
+    // 这里直接落一行，验的是消费侧
+    let asset = uuid::Uuid::new_v4();
+    let channel: i64 = sqlx::query_scalar(
+        "SELECT id FROM channel WHERE provider = 'volcengine' AND enabled ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_handle
+           (id, kind, channel_id, provider, upstream_id, account_chain, endpoint)
+         VALUES ($1, 'asset', $2, 'volcengine', 'asset-up-1', $3, 'asset_upload')",
+    )
+    .bind(asset)
+    .bind(channel)
+    .bind(vec![fx.account])
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/volcengine/assets/gwh_{}/delete",
+            fx.base,
+            asset.simple()
+        ))
+        .bearer_auth(&fx.api_key)
+        .json(&serde_json::json!({ "reason": "test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let echoed: serde_json::Value = resp.json().await.unwrap();
+
+    let auth = echoed["authorization"].as_str().unwrap();
+    assert!(
+        auth.starts_with("HMAC-SHA256 Credential=AKLTtest/"),
+        "上游收到的不是火山引擎 V4 签名: {auth}"
+    );
+    assert!(
+        auth.contains("/cn-beijing/cv/request,"),
+        "作用域应当来自描述文件声明的 service/region: {auth}"
+    );
+    assert!(auth.contains("SignedHeaders=content-type;host;x-content-sha256;x-date,"));
+    assert!(!echoed["x_date"].as_str().unwrap().is_empty());
+
+    // 签的体摘要必须等于上游真正收到的那份体
+    assert_eq!(
+        echoed["x_content_sha256"], echoed["body_sha256"],
+        "签名覆盖的体与实际发出的体不一致"
+    );
+}
+
+/// 渠道凭证没按 `<AK>:<SK>` 配时，请求不该带着半截凭证发出去
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_signing_credential_fails_before_forwarding() {
+    let fx = setup(START_BALANCE, 64).await;
+    fx.add_channel("volcengine", b"no-colon-here").await;
+
+    let asset = uuid::Uuid::new_v4();
+    let channel: i64 = sqlx::query_scalar(
+        "SELECT id FROM channel WHERE provider = 'volcengine' AND enabled ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_handle
+           (id, kind, channel_id, provider, upstream_id, account_chain, endpoint)
+         VALUES ($1, 'asset', $2, 'volcengine', 'asset-up-2', $3, 'asset_upload')",
+    )
+    .bind(asset)
+    .bind(channel)
+    .bind(vec![fx.account])
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/volcengine/assets/gwh_{}/delete",
+            fx.base,
+            asset.simple()
+        ))
+        .bearer_auth(&fx.api_key)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
 }

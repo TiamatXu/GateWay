@@ -6,7 +6,7 @@
 
 use gw_core::{BillingTiming, EndpointShape, RequestForm, ResponseForm};
 
-use crate::schema::{CredentialDef, EndpointDef, InjectDef};
+use crate::schema::{CredentialDef, EndpointDef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Milestone {
@@ -73,21 +73,15 @@ pub fn gaps(ep: &EndpointDef, auth: Option<&crate::schema::AuthDef>) -> Vec<Unsu
     let mut out = Vec::new();
     shape_gaps(ep.shape, &mut out);
 
-    if let Some(auth) = auth {
-        if matches!(auth.credential, CredentialDef::Oauth2ClientCredentials(_)) {
-            out.push(Unsupported {
-                field: "auth.credential",
-                value: "oauth2_client_credentials".to_owned(),
-                needs: Milestone::M3,
-            });
-        }
-        if matches!(auth.inject, InjectDef::Sign(_)) {
-            out.push(Unsupported {
-                field: "auth.inject",
-                value: "sign".to_owned(),
-                needs: Milestone::M3,
-            });
-        }
+    // auth.inject: sign 已实现（M3 §2），只有 token 换取还需要 IO 与缓存
+    if let Some(auth) = auth
+        && matches!(auth.credential, CredentialDef::Oauth2ClientCredentials(_))
+    {
+        out.push(Unsupported {
+            field: "auth.credential",
+            value: "oauth2_client_credentials".to_owned(),
+            needs: Milestone::M3,
+        });
     }
 
     out

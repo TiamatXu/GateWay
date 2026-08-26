@@ -173,6 +173,7 @@ impl Cx<'_> {
         }
 
         validate_handles(&ep, &inbound_params, &err)?;
+        validate_auth(&auth, &err)?;
 
         let protocol = ep
             .protocol
@@ -345,6 +346,23 @@ fn validate_handles(
                 "handles.consume 引用了路径参数 {name}，但入站路径 {} 没有声明它",
                 ep.route.inbound
             )));
+        }
+    }
+    Ok(())
+}
+
+/// 签名要按 `<service, region>` 派生密钥，缺一算出来的签名必然被上游拒。
+/// 加载期报比运行期拿一个上游鉴权错误好排查得多。
+fn validate_auth(
+    auth: &AuthDef,
+    err: &impl Fn(String) -> RegistryError,
+) -> Result<(), RegistryError> {
+    if let crate::schema::InjectDef::Sign(d) = &auth.inject {
+        if d.service.is_none() {
+            return Err(err("auth.inject.sign 缺少 service".to_owned()));
+        }
+        if d.region.is_none() {
+            return Err(err("auth.inject.sign 缺少 region".to_owned()));
         }
     }
     Ok(())

@@ -44,6 +44,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 gw-ledger = { workspace = true, features = ["testkit"] }
 gw-store = { workspace = true, features = ["testkit"] }
 reqwest = { workspace = true }
+sha2 = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
 sqlx = { workspace = true }
 axum = { workspace = true }

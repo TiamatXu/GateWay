@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
@@ -27,7 +27,7 @@ use gw_ledger::{Coordinator, Hold, HoldRequest, LedgerError};
 use gw_meter::{JsonUsageExtractor, SseUsageExtractor, UsageSpec};
 use gw_pricing::{PriceCtx, PriceEngine};
 use gw_proxy::{Tee, TeeStream, Upstream, prepare_upstream_headers};
-use gw_registry::{Catalog, EndpointDesc, InboundMatch, Method};
+use gw_registry::{Catalog, EndpointDesc, Method};
 use gw_resource::ResourceStore;
 use gw_resource::store::NewTask;
 use http_body_util::{BodyExt, BodyStream, Full, Limited};
@@ -483,7 +483,25 @@ async fn handle(
     // 8. 转发。上游地址、方法、注入的头全部来自描述文件。
     // 渠道的 base_url 覆盖描述文件的默认值——描述文件给的是厂商官方地址，
     // 渠道可能指向自建代理或另一个地域。
-    let uri = build_upstream_uri(&matched, bound.desc, &channel.base_url, &bound.credential)?;
+    // 命名不能与入站 path 撞车：结算与计价按入站路径匹配规则，取错就是错的账
+    let upstream_path = matched.upstream_path(bound.desc).map_err(|e| {
+        tracing::error!(endpoint = %bound.desc.id, error = %e, "渲染上游路径失败");
+        internal()
+    })?;
+    let out = crate::upstream::prepare(
+        bound.desc,
+        &upstream_path,
+        &channel.base_url,
+        &bound.credential,
+        &extra_headers,
+        &outbound_body,
+        started_at,
+    )
+    .map_err(|e| {
+        tracing::error!(endpoint = %bound.desc.id, error = %e, "凭证注入失败");
+        internal()
+    })?;
+    let uri = out.uri;
     let mut req = axum::http::Request::builder()
         .method(bound.desc.method.as_str())
         .uri(&uri)
@@ -492,10 +510,7 @@ async fn handle(
             tracing::error!(error = %e, uri = %uri, "构造上游请求失败");
             internal()
         })?;
-    *req.headers_mut() = prepare_upstream_headers(
-        headers,
-        &upstream_headers(bound.desc, &bound.credential, &extra_headers)?,
-    );
+    *req.headers_mut() = prepare_upstream_headers(headers, &out.headers);
 
     let upstream_resp = match st.upstream.send(req).await {
         Ok(r) => r,
@@ -882,69 +897,6 @@ fn buffered_response(status: StatusCode, resp_headers: &HeaderMap, body: Bytes) 
     copy_response_headers(status, resp_headers)
         .body(Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
-/// 拼上游 URL：渠道地址 + 渲染后的上游路径 + 声明的查询参数。
-fn build_upstream_uri(
-    matched: &InboundMatch<'_>,
-    desc: &EndpointDesc,
-    channel_base_url: &str,
-    credential: &str,
-) -> Result<String, Reject> {
-    let path = matched.upstream_path(desc).map_err(|e| {
-        tracing::error!(endpoint = %desc.id, error = %e, "渲染上游路径失败");
-        internal()
-    })?;
-    let mut uri = format!("{}{}", channel_base_url.trim_end_matches('/'), path);
-
-    let mut query: Vec<(String, String)> = desc.query.clone();
-    if let Ok(gw_registry::Injected::Query { name, value }) =
-        gw_registry::inject(&desc.auth, credential)
-    {
-        query.push((name, value));
-    }
-    if !query.is_empty() {
-        let joined = query
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        uri.push(if uri.contains('?') { '&' } else { '?' });
-        uri.push_str(&joined);
-    }
-    Ok(uri)
-}
-
-/// 注入上游的头：描述文件声明的固定头、句柄改写后的头，加上凭证注入。
-fn upstream_headers(
-    desc: &EndpointDesc,
-    credential: &str,
-    rewritten: &[(String, String)],
-) -> Result<HeaderMap, Reject> {
-    let mut out = HeaderMap::new();
-    let mut put = |name: &str, value: &str| {
-        if let (Ok(n), Ok(v)) = (HeaderName::try_from(name), HeaderValue::from_str(value)) {
-            out.insert(n, v);
-        } else {
-            tracing::warn!(endpoint = %desc.id, name, "声明的头名或值不合法，已跳过");
-        }
-    };
-    for (name, value) in &desc.headers {
-        put(name, value);
-    }
-    for (name, value) in rewritten {
-        put(name, value);
-    }
-    if !credential.is_empty()
-        && let gw_registry::Injected::Header { name, value } =
-            gw_registry::inject(&desc.auth, credential).map_err(|e| {
-                tracing::error!(endpoint = %desc.id, error = %e, "凭证注入失败");
-                internal()
-            })?
-    {
-        put(&name, &value);
-    }
-    Ok(out)
 }
 
 /// 随响应流一同析构的两样东西：结算哨兵与并发名额。

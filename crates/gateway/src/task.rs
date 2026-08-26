@@ -12,11 +12,11 @@ use bytes::Bytes;
 use chrono::Utc;
 use gw_core::RequestId;
 use gw_proxy::{Upstream, prepare_upstream_headers};
+use gw_registry::EndpointDesc;
 use gw_registry::locator::Locator;
 use gw_registry::schema::AsyncDef;
-use gw_registry::{EndpointDesc, Injected};
 use gw_resource::store::{Handle, ResourceStore, Task};
-use http::{HeaderMap, HeaderName, HeaderValue};
+use http::HeaderMap;
 use http_body_util::{BodyExt, Full, Limited};
 use smol_str::SmolStr;
 use sqlx::PgPool;
@@ -240,33 +240,24 @@ impl TaskSweeper {
         let params: HashMap<SmolStr, String> = HashMap::from([(param, handle.upstream_id.clone())]);
         let path = poll.upstream.render(&params).ok()?;
         let credential = String::from_utf8(channel.credential).unwrap_or_default();
-        let uri = format!("{}{}", channel.base_url.trim_end_matches('/'), path);
+        let body = Bytes::new();
+        let out = crate::upstream::prepare(
+            poll,
+            &path,
+            &channel.base_url,
+            &credential,
+            &[],
+            &body,
+            Utc::now(),
+        )
+        .ok()?;
 
-        let mut inject = HeaderMap::new();
-        for (name, value) in &poll.headers {
-            if let (Ok(n), Ok(v)) = (
-                HeaderName::try_from(name.as_str()),
-                HeaderValue::from_str(value),
-            ) {
-                inject.insert(n, v);
-            }
-        }
-        if let Ok(Injected::Header { name, value }) = gw_registry::inject(&poll.auth, &credential)
-            && let (Ok(n), Ok(v)) = (
-                HeaderName::try_from(name.as_str()),
-                HeaderValue::from_str(&value),
-            )
-        {
-            inject.insert(n, v);
-        }
-
-        let req = http::Request::builder()
+        let mut req = http::Request::builder()
             .method(poll.method.as_str())
-            .uri(&uri)
-            .body(Full::new(Bytes::new()))
+            .uri(&out.uri)
+            .body(Full::new(body))
             .ok()?;
-        let mut req = req;
-        *req.headers_mut() = prepare_upstream_headers(&HeaderMap::new(), &inject);
+        *req.headers_mut() = prepare_upstream_headers(&HeaderMap::new(), &out.headers);
 
         let resp = match self.upstream.send(req).await {
             Ok(r) => r,

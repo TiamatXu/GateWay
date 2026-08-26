@@ -210,6 +210,9 @@
   `task::advance`；当前只处理任务 ID 在路径参数里的轮询端点
 - ~~`OnTerminal` 计费时点~~ ✅ `Hold::detach()` 把预扣托管到句柄上，
   TTL 不取消（防死冻结第 5 道防线）；非 token 维度的预扣上限来自 `usage.estimate`
+- ~~AK/SK 请求签名（`auth.inject: sign`）~~ ✅ 火山引擎 V4 与 AWS SigV4 参数化成一张表，
+  差别只有四处；凭证按 `<AK>:<SK>` 存。算法由 AWS 官方 get-vanilla 向量与
+  独立实现的火山向量双重钉死
 - 对外同时暴露原生 poll 端点（透传）与统一任务 API
 - **智能路由**：过滤（熔断中/不支持该模型/亲和不匹配/已禁用）→ 加权打分（价格、P99 延迟、错误率、在途负载、优先级）→ 选择（最高分 / 加权随机）。健康统计保持节点本地，不跨节点同步。
 
@@ -220,8 +223,10 @@
 **验收标准**：**阿里云百炼原生异步端点 + 火山引擎资产 API 接通**——这是立项时点名的两个痛点，也是 `JsonThenBinary` 与 `Metered` 两种形态的首次实战
 
 **进度**：阿里云百炼原生异步端点已接通（e2e 覆盖提交 → 轮询 → 终态结算、归属隔离、
-孤儿巡检）。火山引擎资产 API 仍延期，缺 `RequestForm::JsonThenBinary`、
-`auth.inject: sign`（AK/SK 签名）与 `BillingTiming::Metered`。
+孤儿巡检）。火山引擎资产 API 的鉴权难点已解决，`asset_delete` 已接客；
+`asset_upload` 仍缺 `RequestForm::JsonThenBinary` 与 `BillingTiming::Metered`。
+另有一处遗留：`asset_delete` 的上游请求不带资产 ID，需对着厂商文档一并补完
+（见 M3 设计文档 §17）。
 
 设计与已否决方案见 `2026-08-26-m3-handle-async-design.md`。
 

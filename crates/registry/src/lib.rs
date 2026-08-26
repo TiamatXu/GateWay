@@ -15,6 +15,7 @@ pub mod locator;
 pub mod milestone;
 pub mod rule;
 pub mod schema;
+pub mod sign;
 pub mod template;
 
 pub use auth::{AuthError, Injected, inject};
@@ -27,6 +28,7 @@ pub use locator::{Locator, PathExpr};
 pub use milestone::{IMPLEMENTED, Milestone, Unsupported};
 pub use rule::{Source, UsageRule};
 pub use schema::{Descriptor, Method, SCHEMA_VERSION};
+pub use sign::{SignCtx, SignError};
 pub use template::PathTemplate;
 
 /// 端点目录的只读视图。数据平面按此取绑定，不关心目录怎么来的。

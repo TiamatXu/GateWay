@@ -894,7 +894,9 @@ name = "gw-registry"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "chrono",
  "gw-core",
+ "hmac",
  "matchit",
  "rstest",
  "schemars",
@@ -902,6 +904,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "serde_json_path",
+ "sha2",
  "smol_str",
  "thiserror",
  "tracing",

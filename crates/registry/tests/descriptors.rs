@@ -226,6 +226,27 @@ fn unimplemented_endpoints_are_deferred_not_routed() {
     );
 }
 
+/// AK/SK 签名落地后，火山引擎的资产删除端点开始接客
+#[test]
+fn signed_endpoints_are_live() {
+    let loaded = load();
+    let deferred: Vec<_> = loaded
+        .deferred
+        .iter()
+        .map(|d| format!("{}/{}", d.provider.as_str(), d.endpoint))
+        .collect();
+    assert!(
+        !deferred.contains(&"volcengine/asset_delete".to_owned()),
+        "延期清单: {deferred:?}"
+    );
+    assert!(
+        loaded
+            .catalog
+            .resolve(Method::Post, "/volcengine/assets/abc/delete")
+            .is_some()
+    );
+}
+
 /// M3 §4.3/§4.4：句柄映射与异步托管落地后，阿里云百炼的提交与轮询端点开始接客
 #[test]
 fn async_task_endpoints_are_live() {

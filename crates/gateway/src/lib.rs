@@ -10,6 +10,7 @@ pub mod probe;
 pub mod protocol_error;
 pub mod settlement;
 pub mod task;
+pub(crate) mod upstream;
 
 pub use admission::{Admission, LoadGuard, LoadGuardConfig, LoadSample, RejectReason, Signal};
 pub use app::{AppState, GatewayConfig, router};
