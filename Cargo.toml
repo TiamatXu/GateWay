@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.96"
-license = "Apache-2.0"
+license = "MIT"
 publish = false
 
 [workspace.dependencies]
